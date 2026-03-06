@@ -1,0 +1,78 @@
+#include <zephyr/dt-bindings/i2c/i2c.h>
+#include <zephyr/dt-bindings/pinctrl/esp32c6-pinctrl.h>
+
+/ {
+	chosen {
+		zephyr,display = &ssd1309_oled;
+	};
+
+	aliases {
+		rtc = &pcf8563_rtc;
+	};
+};
+
+&pinctrl {
+	spi2_oled_pins: spi2_oled_pins {
+		group1 {
+			pinmux = <SPIM2_SCLK_GPIO19>;
+		};
+
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO20>;
+			output-low;
+		};
+	};
+
+	i2c0_rtc_pins: i2c0_rtc_pins {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO22>,
+				 <I2C0_SCL_GPIO23>;
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+/* Free GPIO3 for display CS (board default uses it for RF switch enable). */
+&rf_switch {
+	status = "disabled";
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spi2_oled_pins>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
+
+	ssd1309_oled: ssd1309@0 {
+		compatible = "solomon,ssd1309";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		width = <128>;
+		height = <64>;
+		segment-offset = <0>;
+		page-offset = <0>;
+		display-offset = <0>;
+		multiplex-ratio = <63>;
+		segment-remap;
+		com-invdir;
+		prechargep = <0x22>;
+		data-cmd-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	pinctrl-0 = <&i2c0_rtc_pins>;
+	pinctrl-names = "default";
+
+	pcf8563_rtc: pcf8563@51 {
+		compatible = "nxp,pcf8563";
+		reg = <0x51>;
+		status = "okay";
+	};
+};

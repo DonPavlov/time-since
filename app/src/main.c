@@ -1,80 +1,142 @@
 /*
- * Copyright (c) 2021 Nordic Semiconductor ASA
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
+#include <stdio.h>
+
+#include <lvgl.h>
+
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/display.h>
+#include <zephyr/drivers/rtc.h>
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/sensor.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 
-#include <app/drivers/blink.h>
+LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
-#include <app_version.h>
+static const int32_t sleep_time_ms = 50;
+static const uint32_t circle_radius = 8U;
+static const uint32_t ticks_per_second = 1000U / sleep_time_ms;
 
-LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
+static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
-#define BLINK_PERIOD_MS_STEP 100U
-#define BLINK_PERIOD_MS_MAX  1000U
+static void update_rtc_label(lv_obj_t *rtc_label)
+{
+	struct rtc_time tm = { 0 };
+	char rtc_buf[16];
+	int ret;
+
+	if (!device_is_ready(rtc)) {
+		lv_label_set_text(rtc_label, "RTC not ready");
+		return;
+	}
+
+	ret = rtc_get_time(rtc, &tm);
+	if (ret < 0) {
+		lv_label_set_text(rtc_label, "RTC read error");
+		return;
+	}
+
+	snprintf(rtc_buf, sizeof(rtc_buf), "%02d:%02d:%02d",
+		 tm.tm_hour, tm.tm_min, tm.tm_sec);
+	lv_label_set_text(rtc_label, rtc_buf);
+}
 
 int main(void)
 {
+	uint32_t count = 0;
+	uint32_t circle_pos = 0;
+	char counter_buf[12] = { 0 };
+	const struct device *display;
+	struct display_capabilities caps;
+	lv_obj_t *hello_label;
+	lv_obj_t *counter_label;
+	lv_obj_t *rtc_label;
+	lv_obj_t *rect;
+	lv_obj_t *circle;
+	lv_style_t counter_label_style;
+	lv_style_t rect_style;
+	lv_style_t circle_style;
+	static lv_point_precise_t rect_points[] = {
+		{ 0, 0 }, { 120, 0 }, { 120, 20 }, { 0, 20 }, { 0, 0 }
+	};
 	int ret;
-	unsigned int period_ms = BLINK_PERIOD_MS_MAX;
-	const struct device *sensor, *blink;
-	struct sensor_value last_val = { 0 }, val;
 
-	printk("Zephyr Example Application %s\n", APP_VERSION_STRING);
+	LOG_INF("main() started");
 
-	sensor = DEVICE_DT_GET(DT_NODELABEL(example_sensor));
-	if (!device_is_ready(sensor)) {
-		LOG_ERR("Sensor not ready");
+	display = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
+	if (!device_is_ready(display)) {
+		LOG_ERR("display not ready");
 		return 0;
 	}
 
-	blink = DEVICE_DT_GET(DT_NODELABEL(blink_led));
-	if (!device_is_ready(blink)) {
-		LOG_ERR("Blink LED not ready");
+	display_get_capabilities(display, &caps);
+
+	hello_label = lv_label_create(lv_screen_active());
+	lv_label_set_text(hello_label, "Hello, World!");
+	lv_obj_align(hello_label, LV_ALIGN_TOP_MID, 0, 3);
+
+	lv_style_init(&counter_label_style);
+	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_20);
+
+	counter_label = lv_label_create(lv_screen_active());
+	lv_obj_add_style(counter_label, &counter_label_style, 0);
+	lv_obj_align(counter_label, LV_ALIGN_BOTTOM_RIGHT, -2, -1);
+	lv_label_set_text(counter_label, "0");
+
+	rtc_label = lv_label_create(lv_screen_active());
+	lv_obj_align(rtc_label, LV_ALIGN_BOTTOM_LEFT, 2, -1);
+	lv_label_set_text(rtc_label, "RTC...");
+	update_rtc_label(rtc_label);
+
+	lv_style_init(&rect_style);
+	lv_style_set_line_width(&rect_style, 2);
+	lv_style_set_line_color(&rect_style, lv_color_white());
+
+	rect = lv_line_create(lv_screen_active());
+	lv_obj_add_style(rect, &rect_style, 0);
+	lv_line_set_points(rect, rect_points, ARRAY_SIZE(rect_points));
+	lv_obj_align(rect, LV_ALIGN_TOP_MID, 0, 0);
+
+	lv_style_init(&circle_style);
+	lv_style_set_radius(&circle_style, LV_RADIUS_CIRCLE);
+	lv_style_set_bg_opa(&circle_style, LV_OPA_COVER);
+	lv_style_set_bg_color(&circle_style, lv_color_white());
+	lv_style_set_border_width(&circle_style, 0);
+
+	circle = lv_obj_create(lv_screen_active());
+	lv_obj_set_size(circle, circle_radius * 2U, circle_radius * 2U);
+	lv_obj_add_style(circle, &circle_style, 0);
+	lv_obj_align(circle, LV_ALIGN_LEFT_MID, -(int32_t)circle_radius, 0);
+
+	lv_timer_handler();
+	ret = display_blanking_off(display);
+	if (ret < 0 && ret != -ENOSYS) {
+		LOG_ERR("display blanking off failed (%d)", ret);
 		return 0;
 	}
-
-	ret = blink_off(blink);
-	if (ret < 0) {
-		LOG_ERR("Could not turn off LED (%d)", ret);
-		return 0;
-	}
-
-	printk("Use the sensor to change LED blinking period\n");
 
 	while (1) {
-		ret = sensor_sample_fetch(sensor);
-		if (ret < 0) {
-			LOG_ERR("Could not fetch sample (%d)", ret);
-			return 0;
+		if ((count % ticks_per_second) == 0U) {
+			snprintf(counter_buf, sizeof(counter_buf), "%u", count / ticks_per_second);
+			LOG_INF("tick: %s", counter_buf);
+			lv_label_set_text(counter_label, counter_buf);
+			update_rtc_label(rtc_label);
+		}
+		count++;
+
+		if (circle_pos >= caps.x_resolution) {
+			circle_pos = 0U;
 		}
 
-		ret = sensor_channel_get(sensor, SENSOR_CHAN_PROX, &val);
-		if (ret < 0) {
-			LOG_ERR("Could not get sample (%d)", ret);
-			return 0;
-		}
+		lv_obj_align(circle, LV_ALIGN_LEFT_MID,
+			     (int32_t)circle_pos - (int32_t)circle_radius, 0);
+		circle_pos += MAX(1U, caps.x_resolution / ticks_per_second);
 
-		if ((last_val.val1 == 0) && (val.val1 == 1)) {
-			if (period_ms == 0U) {
-				period_ms = BLINK_PERIOD_MS_MAX;
-			} else {
-				period_ms -= BLINK_PERIOD_MS_STEP;
-			}
-
-			printk("Proximity detected, setting LED period to %u ms\n",
-			       period_ms);
-			blink_set_period_ms(blink, period_ms);
-		}
-
-		last_val = val;
-
-		k_sleep(K_MSEC(100));
+		lv_timer_handler();
+		k_msleep(sleep_time_ms);
 	}
-
-	return 0;
 }
-
