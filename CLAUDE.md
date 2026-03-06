@@ -17,9 +17,6 @@ west build -b xiao_esp32c6/esp32c6/hpcore app
 # Flash
 west flash
 
-# Build with debug config
-west build -b xiao_esp32c6/esp32c6/hpcore app -- -DEXTRA_CONF_FILE=debug.conf
-
 # Run tests
 west twister -T tests --integration
 ```
