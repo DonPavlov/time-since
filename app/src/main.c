@@ -31,9 +31,13 @@ static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
 /* Global state */
 static bool wifi_connected = false;
+static bool ntp_synced = false;
 static uint32_t boot_time_seconds = 0;
 static uint32_t last_rtc_check = 0;
 static const uint32_t RTC_CHECK_INTERVAL = 300; /* 5 minutes in seconds */
+static struct net_mgmt_event_callback wifi_cb;
+static struct net_mgmt_event_callback ipv4_cb;
+static size_t wifi_network_idx = 0;
 
 static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
 				uint64_t mgmt_event, struct net_if *iface)
@@ -46,91 +50,138 @@ static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
 		} else {
 			LOG_ERR("WiFi connection failed: %d", status->status);
 			wifi_connected = false;
+			wifi_network_idx++;
+		}
+	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
+		LOG_INF("WiFi disconnected");
+		wifi_connected = false;
+	}
+}
+
+static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
+			      uint64_t mgmt_event, struct net_if *iface)
+{
+	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
+		char buf[16];
+		const struct in_addr *addr = net_if_ipv4_get_global_addr(iface,
+							NET_ADDR_PREFERRED);
+		if (addr) {
+			net_addr_ntop(AF_INET, addr, buf, sizeof(buf));
+			LOG_INF("IP address obtained: %s", buf);
+		} else {
+			LOG_INF("IP address assigned");
 		}
 	}
 }
 
-static int connect_to_wifi(void)
+static void start_wifi_connect(void)
 {
 	struct net_if *iface = net_if_get_default();
 	struct wifi_connect_req_params wifi_params = { 0 };
-	struct net_mgmt_event_callback wifi_cb;
 
-	if (!iface) {
-		LOG_ERR("No network interface found");
-		return -1;
+	if (!iface || wifi_connected) {
+		return;
 	}
 
-	/* Try to connect to known networks */
-	for (size_t i = 0; i < KNOWN_NETWORKS_COUNT; i++) {
-		const struct wifi_network *net = &known_networks[i];
-
-		wifi_params.ssid = net->ssid;
-		wifi_params.ssid_length = strlen(net->ssid);
-		wifi_params.psk = net->password;
-		wifi_params.psk_length = strlen(net->password);
-		wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-		wifi_params.channel = WIFI_CHANNEL_ANY;
-
-		net_mgmt_init_event_callback(&wifi_cb, wifi_connect_handler,
-					   NET_EVENT_WIFI_CONNECT_RESULT);
-		net_mgmt_add_event_callback(&wifi_cb);
-
-		LOG_INF("Attempting to connect to WiFi: %s", net->ssid);
-		int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params,
-				 sizeof(struct wifi_connect_req_params));
-		if (ret == 0) {
-			/* Wait a bit for connection */
-			k_sleep(K_SECONDS(5));
-			if (wifi_connected) {
-				return 0;
-			}
-		}
-		net_mgmt_del_event_callback(&wifi_cb);
+	if (wifi_network_idx >= KNOWN_NETWORKS_COUNT) {
+		wifi_network_idx = 0;
 	}
 
-	return -1;
+	const struct wifi_network *net = &known_networks[wifi_network_idx];
+
+	wifi_params.ssid = net->ssid;
+	wifi_params.ssid_length = strlen(net->ssid);
+	wifi_params.psk = net->password;
+	wifi_params.psk_length = strlen(net->password);
+	wifi_params.security = WIFI_SECURITY_TYPE_PSK;
+	wifi_params.channel = WIFI_CHANNEL_ANY;
+
+	LOG_INF("Attempting to connect to WiFi: %s", net->ssid);
+	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params,
+			 sizeof(struct wifi_connect_req_params));
+	if (ret != 0) {
+		LOG_ERR("WiFi connect request failed: %d", ret);
+		wifi_network_idx++;
+	}
 }
 
-static int sync_time_via_ntp(void)
+/* Try a single NTP sync attempt (non-blocking-friendly, short timeout) */
+static int try_ntp_sync(void)
 {
 	struct sntp_time sntp_time;
 	int ret;
 
-	LOG_INF("Syncing time via NTP...");
-	ret = sntp_simple("pool.ntp.org", 5000, &sntp_time);
+	LOG_INF("Trying NTP sync...");
+	ret = sntp_simple("time.cloudflare.com", 2000, &sntp_time);
 	if (ret < 0) {
-		LOG_ERR("NTP sync failed: %d", ret);
+		LOG_WRN("NTP failed: %d", ret);
 		return ret;
 	}
 
-	/* Convert SNTP seconds to broken-down time */
+	/* Apply Europe/Berlin timezone offset (CET=UTC+1, CEST=UTC+2) */
 	time_t ts = (time_t)sntp_time.seconds;
-	struct tm *gm = gmtime(&ts);
-	if (gm == NULL) {
-		LOG_ERR("gmtime failed");
+	struct tm *utc = gmtime(&ts);
+	if (utc == NULL) {
 		return -1;
 	}
 
+	/* DST: last Sunday of March 02:00 UTC to last Sunday of October 03:00 UTC */
+	bool is_dst = false;
+	if (utc->tm_mon > 2 && utc->tm_mon < 9) {
+		/* April through September: always CEST */
+		is_dst = true;
+	} else if (utc->tm_mon == 2) {
+		/* March: CEST after last Sunday at 02:00 UTC */
+		int last_sun = 31 - ((5 + utc->tm_year + utc->tm_year / 4) % 7);
+		if (utc->tm_mday > last_sun ||
+		    (utc->tm_mday == last_sun && utc->tm_hour >= 2)) {
+			is_dst = true;
+		}
+	} else if (utc->tm_mon == 9) {
+		/* October: CET after last Sunday at 03:00 UTC */
+		int last_sun = 31 - ((2 + utc->tm_year + utc->tm_year / 4) % 7);
+		if (utc->tm_mday < last_sun ||
+		    (utc->tm_mday == last_sun && utc->tm_hour < 3)) {
+			is_dst = true;
+		}
+	}
+
+	ts += is_dst ? 7200 : 3600;
+	struct tm *local = gmtime(&ts);
+	if (local == NULL) {
+		return -1;
+	}
+
+	LOG_INF("Timezone: %s (UTC%s)", is_dst ? "CEST" : "CET",
+		is_dst ? "+2" : "+1");
+
 	struct rtc_time rtc_time = {
-		.tm_year = gm->tm_year,
-		.tm_mon = gm->tm_mon,
-		.tm_mday = gm->tm_mday,
-		.tm_hour = gm->tm_hour,
-		.tm_min = gm->tm_min,
-		.tm_sec = gm->tm_sec,
-		.tm_wday = gm->tm_wday,
+		.tm_year = local->tm_year,
+		.tm_mon = local->tm_mon,
+		.tm_mday = local->tm_mday,
+		.tm_hour = local->tm_hour,
+		.tm_min = local->tm_min,
+		.tm_sec = local->tm_sec,
+		.tm_wday = local->tm_wday,
 	};
 
 	if (device_is_ready(rtc)) {
 		ret = rtc_set_time(rtc, &rtc_time);
 		if (ret == 0) {
-			LOG_INF("RTC updated via NTP: %04d-%02d-%02d %02d:%02d:%02d",
-				rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
-				rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+			LOG_INF("Online time: %04d-%02d-%02d %02d:%02d:%02d",
+				rtc_time.tm_year + 1900, rtc_time.tm_mon + 1,
+				rtc_time.tm_mday, rtc_time.tm_hour,
+				rtc_time.tm_min, rtc_time.tm_sec);
+			/* Read back RTC to confirm */
+			struct rtc_time readback = { 0 };
+			if (rtc_get_time(rtc, &readback) == 0) {
+				LOG_INF("Device time: %04d-%02d-%02d %02d:%02d:%02d",
+					readback.tm_year + 1900,
+					readback.tm_mon + 1,
+					readback.tm_mday, readback.tm_hour,
+					readback.tm_min, readback.tm_sec);
+			}
 			return 0;
-		} else {
-			LOG_ERR("Failed to set RTC time: %d", ret);
 		}
 	}
 
@@ -168,90 +219,148 @@ static uint32_t calculate_elapsed_seconds(void)
 	return boot_time_seconds;
 }
 
-static void check_and_sync_rtc(void)
+static void disconnect_wifi(void)
 {
-	struct rtc_time rtc_now = { 0 };
-	uint32_t rtc_seconds = 0;
-	uint32_t local_seconds = 0;
+	struct net_if *iface = net_if_get_default();
 
-	if (!device_is_ready(rtc) || !wifi_connected) {
+	if (!iface || !wifi_connected) {
 		return;
 	}
 
-	/* Get current RTC time */
-	if (rtc_get_time(rtc, &rtc_now) != 0) {
-		return;
+	int ret = net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+	if (ret != 0) {
+		LOG_ERR("WiFi disconnect failed: %d", ret);
 	}
+	wifi_connected = false;
+}
 
-	rtc_seconds = (uint32_t)(rtc_now.tm_hour * 3600 +
-				rtc_now.tm_min * 60 +
-				rtc_now.tm_sec);
+/* WiFi/NTP state machine states */
+enum sync_state {
+	SYNC_IDLE,
+	SYNC_CONNECTING,
+	SYNC_NTP,
+	SYNC_DONE,
+};
 
-	/* Get NTP time for comparison */
-	struct sntp_time sntp_time;
-	if (sntp_simple("pool.ntp.org", 2000, &sntp_time) == 0) {
-		local_seconds = sntp_time.seconds % 86400; /* Seconds since midnight */
+static enum sync_state sync_state = SYNC_IDLE;
+static uint32_t sync_timer = 0;
+static int ntp_attempts = 0;
 
-		/* Check if difference is > 5 seconds */
-		int32_t diff = (int32_t)rtc_seconds - (int32_t)local_seconds;
-		if (abs(diff) > 5) {
-			LOG_INF("RTC time drift detected (%d seconds), syncing...", diff);
-			sync_time_via_ntp();
+static void sync_start(void)
+{
+	sync_state = SYNC_CONNECTING;
+	sync_timer = 0;
+	ntp_attempts = 0;
+	wifi_network_idx = 0;
+	start_wifi_connect();
+}
+
+/* Called once per second from main loop. Returns true when sync complete. */
+static bool sync_tick(void)
+{
+	sync_timer++;
+
+	switch (sync_state) {
+	case SYNC_IDLE:
+		break;
+
+	case SYNC_CONNECTING:
+		if (wifi_connected) {
+			/* Wait a few seconds for DHCP before first NTP attempt */
+			if (sync_timer >= 5) {
+				LOG_INF("Trying NTP...");
+				sync_state = SYNC_NTP;
+				sync_timer = 0;
+			}
+		} else if (sync_timer >= 10) {
+			wifi_network_idx++;
+			if (wifi_network_idx >= KNOWN_NETWORKS_COUNT * 3) {
+				LOG_WRN("WiFi connect failed after trying all networks");
+				sync_state = SYNC_DONE;
+				return true;
+			}
+			start_wifi_connect();
+			sync_timer = 0;
 		}
+		break;
+
+	case SYNC_NTP:
+		/* Try NTP every 3 seconds */
+		if (sync_timer >= 3) {
+			sync_timer = 0;
+			if (try_ntp_sync() == 0) {
+				ntp_synced = true;
+				disconnect_wifi();
+				sync_state = SYNC_DONE;
+				return true;
+			}
+			ntp_attempts++;
+			if (ntp_attempts >= 10) {
+				LOG_WRN("NTP failed after %d attempts, giving up",
+					ntp_attempts);
+				disconnect_wifi();
+				sync_state = SYNC_DONE;
+				return true;
+			}
+		}
+		break;
+
+	case SYNC_DONE:
+		break;
 	}
+
+	return false;
 }
 
 int main(void)
 {
 	char counter_buf[32] = { 0 };
 	const struct device *display;
-	struct display_capabilities caps;
 	lv_obj_t *counter_label;
 	lv_obj_t *wifi_label;
 	lv_style_t counter_label_style;
+	lv_style_t wifi_label_style;
+	bool rtc_has_time = false;
 	int ret;
 
 	LOG_INF("main() started");
 
 	/* Initialize display */
-	LOG_INF("Getting display device...");
 	display = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
-	if (display == NULL) {
-		LOG_ERR("display device is NULL");
-		return 0;
-	}
-
-	LOG_INF("Checking if display is ready...");
-	if (!device_is_ready(display)) {
+	if (display == NULL || !device_is_ready(display)) {
 		LOG_ERR("display not ready");
 		return 0;
 	}
-	LOG_INF("Display is ready!");
 
-	display_get_capabilities(display, &caps);
-	LOG_INF("Display caps: x_res=%d, y_res=%d", caps.x_resolution, caps.y_resolution);
-
-	/* Check if RTC has valid time, if not start counting from 0 */
+	/* Check if RTC already has valid time */
 	if (device_is_ready(rtc)) {
 		struct rtc_time rtc_check = { 0 };
-		if (rtc_get_time(rtc, &rtc_check) != 0) {
-			LOG_INF("RTC not initialized, will start counting from 0");
-		} else {
-			LOG_INF("RTC has valid time: %02d:%02d:%02d",
-				rtc_check.tm_hour, rtc_check.tm_min, rtc_check.tm_sec);
+		if (rtc_get_time(rtc, &rtc_check) == 0) {
+			time_t now_epoch = rtc_time_to_epoch(&rtc_check);
+			time_t start_epoch = rtc_time_to_epoch(&START_TIME);
+			if (now_epoch > start_epoch) {
+				LOG_INF("RTC has valid time: %02d:%02d:%02d",
+					rtc_check.tm_hour, rtc_check.tm_min,
+					rtc_check.tm_sec);
+				rtc_has_time = true;
+			}
 		}
 	}
 
-	/* Create UI */
+	/* Create UI - initially hidden */
 	lv_style_init(&counter_label_style);
-	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_20);
+	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_14);
 
 	counter_label = lv_label_create(lv_screen_active());
 	lv_obj_add_style(counter_label, &counter_label_style, 0);
 	lv_obj_align(counter_label, LV_ALIGN_CENTER, 0, 0);
-	lv_label_set_text(counter_label, "0");
+	lv_label_set_text(counter_label, "");
+
+	lv_style_init(&wifi_label_style);
+	lv_style_set_text_font(&wifi_label_style, &lv_font_montserrat_10);
 
 	wifi_label = lv_label_create(lv_screen_active());
+	lv_obj_add_style(wifi_label, &wifi_label_style, 0);
 	lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_RIGHT, -2, -3);
 	lv_label_set_text(wifi_label, "");
 
@@ -262,37 +371,46 @@ int main(void)
 		return 0;
 	}
 
-	/* Wait 2 seconds before trying WiFi */
-	LOG_INF("Waiting 2 seconds before WiFi connection attempt...");
-	k_sleep(K_SECONDS(2));
+	/* Register WiFi callback and kick off initial sync */
+	net_mgmt_init_event_callback(&wifi_cb, wifi_connect_handler,
+				     NET_EVENT_WIFI_CONNECT_RESULT |
+				     NET_EVENT_WIFI_DISCONNECT_RESULT);
+	net_mgmt_add_event_callback(&wifi_cb);
 
-	/* Try to connect to WiFi */
-	if (connect_to_wifi() == 0) {
-		lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
-		/* Wait for DHCP/DNS to become available */
-		k_sleep(K_SECONDS(5));
-		/* Sync time via NTP */
-		sync_time_via_ntp();
-	} else {
-		lv_label_set_text(wifi_label, "");
-	}
+	net_mgmt_init_event_callback(&ipv4_cb, ipv4_addr_handler,
+				     NET_EVENT_IPV4_ADDR_ADD);
+	net_mgmt_add_event_callback(&ipv4_cb);
+	sync_start();
 
 	while (1) {
-		/* Update display every second */
-		uint32_t elapsed = calculate_elapsed_seconds();
-		snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
-		lv_label_set_text(counter_label, counter_buf);
+		/* Update display if RTC has valid time */
+		if (rtc_has_time) {
+			uint32_t elapsed = calculate_elapsed_seconds();
+			snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
+			lv_label_set_text(counter_label, counter_buf);
+		}
 
-		/* Check RTC sync every 5 minutes */
-		if ((boot_time_seconds % RTC_CHECK_INTERVAL) == 0 &&
+		/* Drive the WiFi/NTP state machine */
+		if (sync_state != SYNC_IDLE && sync_state != SYNC_DONE) {
+			lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
+			if (sync_tick()) {
+				lv_label_set_text(wifi_label, "");
+				if (ntp_synced) {
+					rtc_has_time = true;
+				}
+			}
+		}
+
+		/* Periodic re-sync every 5 minutes */
+		if (sync_state == SYNC_DONE &&
+		    (boot_time_seconds % RTC_CHECK_INTERVAL) == 0 &&
 		    boot_time_seconds != last_rtc_check) {
-			check_and_sync_rtc();
 			last_rtc_check = boot_time_seconds;
+			sync_start();
 		}
 
 		lv_timer_handler();
-		k_sleep(K_SECONDS(1)); /* Sleep 1 second */
-
+		k_sleep(K_SECONDS(1));
 		boot_time_seconds++;
 	}
 }
