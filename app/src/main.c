@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h> /* for abs() */
+#include <time.h>
 
 #include <lvgl.h>
 
@@ -103,14 +104,22 @@ static int sync_time_via_ntp(void)
 		return ret;
 	}
 
-	/* Convert to RTC time */
+	/* Convert SNTP seconds to broken-down time */
+	time_t ts = (time_t)sntp_time.seconds;
+	struct tm *gm = gmtime(&ts);
+	if (gm == NULL) {
+		LOG_ERR("gmtime failed");
+		return -1;
+	}
+
 	struct rtc_time rtc_time = {
-		.tm_year = sntp_time.seconds / 31536000 + 70, /* 1970 base */
-		.tm_mon = ((sntp_time.seconds % 31536000) / 2628000) + 1,
-		.tm_mday = ((sntp_time.seconds % 2628000) / 86400) + 1,
-		.tm_hour = (sntp_time.seconds % 86400) / 3600,
-		.tm_min = (sntp_time.seconds % 3600) / 60,
-		.tm_sec = sntp_time.seconds % 60,
+		.tm_year = gm->tm_year,
+		.tm_mon = gm->tm_mon,
+		.tm_mday = gm->tm_mday,
+		.tm_hour = gm->tm_hour,
+		.tm_min = gm->tm_min,
+		.tm_sec = gm->tm_sec,
+		.tm_wday = gm->tm_wday,
 	};
 
 	if (device_is_ready(rtc)) {
@@ -128,29 +137,31 @@ static int sync_time_via_ntp(void)
 	return ret;
 }
 
+static time_t rtc_time_to_epoch(const struct rtc_time *t)
+{
+	struct tm tm_val = {
+		.tm_year = t->tm_year,
+		.tm_mon = t->tm_mon,
+		.tm_mday = t->tm_mday,
+		.tm_hour = t->tm_hour,
+		.tm_min = t->tm_min,
+		.tm_sec = t->tm_sec,
+	};
+	return mktime(&tm_val);
+}
+
 static uint32_t calculate_elapsed_seconds(void)
 {
 	struct rtc_time now = { 0 };
-	uint32_t now_seconds = 0;
-	uint32_t start_seconds = 0;
 
-	/* Calculate start time in seconds since midnight */
-	start_seconds = (uint32_t)(START_TIME.tm_hour * 3600 +
-				  START_TIME.tm_min * 60 +
-				  START_TIME.tm_sec);
-
-	/* Get current RTC time */
 	if (device_is_ready(rtc) && rtc_get_time(rtc, &now) == 0) {
-		now_seconds = (uint32_t)(now.tm_hour * 3600 +
-					now.tm_min * 60 +
-					now.tm_sec);
+		time_t now_epoch = rtc_time_to_epoch(&now);
+		time_t start_epoch = rtc_time_to_epoch(&START_TIME);
 
-		/* If current time is before start time, assume next day */
-		if (now_seconds < start_seconds) {
-			now_seconds += 86400; /* Add 24 hours */
+		if (now_epoch > start_epoch) {
+			return (uint32_t)(now_epoch - start_epoch);
 		}
-
-		return now_seconds - start_seconds;
+		return 0;
 	}
 
 	/* If RTC not available, use boot time counter */
@@ -192,10 +203,9 @@ static void check_and_sync_rtc(void)
 
 int main(void)
 {
-	char counter_buf[16] = { 0 };
+	char counter_buf[32] = { 0 };
 	const struct device *display;
 	struct display_capabilities caps;
-	lv_obj_t *hello_label;
 	lv_obj_t *counter_label;
 	lv_obj_t *wifi_label;
 	lv_style_t counter_label_style;
@@ -233,21 +243,17 @@ int main(void)
 	}
 
 	/* Create UI */
-	hello_label = lv_label_create(lv_screen_active());
-	lv_label_set_text(hello_label, "Zeit seit wir");
-	lv_obj_align(hello_label, LV_ALIGN_TOP_MID, 0, 3);
-
 	lv_style_init(&counter_label_style);
 	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_20);
 
 	counter_label = lv_label_create(lv_screen_active());
 	lv_obj_add_style(counter_label, &counter_label_style, 0);
-	lv_obj_align(counter_label, LV_ALIGN_CENTER, 0, 10);
-	lv_label_set_text(counter_label, "0 s");
+	lv_obj_align(counter_label, LV_ALIGN_CENTER, 0, 0);
+	lv_label_set_text(counter_label, "0");
 
 	wifi_label = lv_label_create(lv_screen_active());
-	lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_LEFT, 2, -3);
-	lv_label_set_text(wifi_label, "WiFi: off");
+	lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_RIGHT, -2, -3);
+	lv_label_set_text(wifi_label, "");
 
 	lv_timer_handler();
 	ret = display_blanking_off(display);
@@ -262,17 +268,19 @@ int main(void)
 
 	/* Try to connect to WiFi */
 	if (connect_to_wifi() == 0) {
-		lv_label_set_text(wifi_label, "WiFi: on");
+		lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
+		/* Wait for DHCP/DNS to become available */
+		k_sleep(K_SECONDS(5));
 		/* Sync time via NTP */
 		sync_time_via_ntp();
 	} else {
-		lv_label_set_text(wifi_label, "WiFi: off");
+		lv_label_set_text(wifi_label, "");
 	}
 
 	while (1) {
 		/* Update display every second */
 		uint32_t elapsed = calculate_elapsed_seconds();
-		snprintf(counter_buf, sizeof(counter_buf), "%u s", elapsed);
+		snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
 		lv_label_set_text(counter_label, counter_buf);
 
 		/* Check RTC sync every 5 minutes */
