@@ -15,6 +15,8 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 
+#include "start_time.h"
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 static const int32_t sleep_time_ms = 50;
@@ -96,6 +98,18 @@ LOG_INF("RTC time set");
 	display_get_capabilities(display, &caps);
 	LOG_INF("Display caps: x_res=%d, y_res=%d",
 		caps.x_resolution, caps.y_resolution);
+
+	LOG_INF("Setting RTC to start time...");
+	if (device_is_ready(rtc)) {
+		ret = rtc_set_time(rtc, (struct rtc_time *)&START_TIME);
+		if (ret == 0) {
+			LOG_INF("RTC initialized to 2025-05-15 21:30:00");
+		} else {
+			LOG_ERR("Failed to set RTC: %d", ret);
+		}
+	} else {
+		LOG_ERR("RTC device not ready");
+	}
 
 	hello_label = lv_label_create(lv_screen_active());
 	lv_label_set_text(hello_label, "Hello, World!");
