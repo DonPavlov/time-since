@@ -67,13 +67,25 @@ int main(void)
 
 	LOG_INF("main() started");
 
+	LOG_INF("Getting display device...");
 	display = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
+	if (display == NULL) {
+		LOG_ERR("display device is NULL");
+		return 0;
+	}
+	LOG_INF("Display device obtained: %p", (void *)display);
+
+	LOG_INF("Checking if display is ready...");
 	if (!device_is_ready(display)) {
 		LOG_ERR("display not ready");
 		return 0;
 	}
+	LOG_INF("Display is ready!");
 
+	LOG_INF("Getting display capabilities...");
 	display_get_capabilities(display, &caps);
+	LOG_INF("Display caps: x_res=%d, y_res=%d",
+		caps.x_resolution, caps.y_resolution);
 
 	hello_label = lv_label_create(lv_screen_active());
 	lv_label_set_text(hello_label, "Hello, World!");
