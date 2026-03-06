@@ -81,7 +81,17 @@ int main(void)
 		return 0;
 	}
 	LOG_INF("Display is ready!");
-
+	LOG_INF("Setting RTC time...");
+struct rtc_time tm = {
+    .tm_year = 126,  // 2026 - 1900
+    .tm_mon = 2,     // March (0-indexed)
+    .tm_mday = 6,
+    .tm_hour = 14,
+    .tm_min = 50,
+    .tm_sec = 0
+};
+rtc_set_time(rtc, &tm);
+LOG_INF("RTC time set");
 	LOG_INF("Getting display capabilities...");
 	display_get_capabilities(display, &caps);
 	LOG_INF("Display caps: x_res=%d, y_res=%d",
