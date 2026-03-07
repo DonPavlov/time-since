@@ -382,12 +382,18 @@ int main(void)
 	net_mgmt_add_event_callback(&ipv4_cb);
 	sync_start();
 
+	uint32_t last_elapsed = UINT32_MAX;
+
 	while (1) {
-		/* Update display if RTC has valid time */
+		/* Update display only when value changes (avoids redundant SPI writes) */
 		if (rtc_has_time) {
 			uint32_t elapsed = calculate_elapsed_seconds();
-			snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
-			lv_label_set_text(counter_label, counter_buf);
+			if (elapsed != last_elapsed) {
+				last_elapsed = elapsed;
+				snprintf(counter_buf, sizeof(counter_buf), "%u",
+					 elapsed);
+				lv_label_set_text(counter_label, counter_buf);
+			}
 		}
 
 		/* Drive the WiFi/NTP state machine */
