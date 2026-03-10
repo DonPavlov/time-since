@@ -21,6 +21,8 @@
 #include <zephyr/net/net_core.h>
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/sntp.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/reboot.h>
 
 #include "start_time.h"
 #include "wifi_creds.h"
@@ -35,9 +37,15 @@ static bool ntp_synced = false;
 static uint32_t boot_time_seconds = 0;
 static uint32_t last_rtc_check = 0;
 static const uint32_t RTC_CHECK_INTERVAL = 300; /* 5 minutes in seconds */
+static const uint32_t AUTO_SLEEP_SECONDS = 180; /* auto-sleep after 3 minutes */
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
 static size_t wifi_network_idx = 0;
+
+/* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
+static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static struct gpio_callback sleep_btn_cb_data;
+static volatile bool sleep_requested;
 
 static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
 				uint64_t mgmt_event, struct net_if *iface)
@@ -312,6 +320,41 @@ static bool sync_tick(void)
 	return false;
 }
 
+static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
+			      uint32_t pins)
+{
+	sleep_requested = true;
+}
+
+static void enter_sleep(const struct device *display)
+{
+	LOG_INF("Entering sleep...");
+
+	/* Turn off OLED */
+	display_blanking_on(display);
+
+	/* Disconnect WiFi if active */
+	disconnect_wifi();
+
+	/* Disable button interrupt while we poll for wake */
+	gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_DISABLE);
+
+	/* Wait for button release (it was just pressed or auto-sleep fired) */
+	while (gpio_pin_get_dt(&sleep_btn)) {
+		k_sleep(K_MSEC(50));
+	}
+	k_sleep(K_MSEC(200)); /* debounce */
+
+	/* Idle-loop until next button press.
+	 * Display and WiFi are off; CPU enters WFI between polls. */
+	while (!gpio_pin_get_dt(&sleep_btn)) {
+		k_sleep(K_SECONDS(1));
+	}
+
+	/* Cold reboot gives a clean restart — RTC retains the time */
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 int main(void)
 {
 	char counter_buf[32] = { 0 };
@@ -347,14 +390,13 @@ int main(void)
 		}
 	}
 
-	/* Create UI - initially hidden */
+	/* Create UI */
 	lv_style_init(&counter_label_style);
 	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_14);
 
 	counter_label = lv_label_create(lv_screen_active());
 	lv_obj_add_style(counter_label, &counter_label_style, 0);
 	lv_obj_align(counter_label, LV_ALIGN_CENTER, 0, 0);
-	lv_label_set_text(counter_label, "");
 
 	lv_style_init(&wifi_label_style);
 	lv_style_set_text_font(&wifi_label_style, &lv_font_montserrat_10);
@@ -362,13 +404,40 @@ int main(void)
 	wifi_label = lv_label_create(lv_screen_active());
 	lv_obj_add_style(wifi_label, &wifi_label_style, 0);
 	lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_RIGHT, -2, -3);
-	lv_label_set_text(wifi_label, "");
+
+	/* Show content on the very first frame — never boot to a blank screen */
+	if (rtc_has_time) {
+		uint32_t elapsed = calculate_elapsed_seconds();
+		snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
+		lv_label_set_text(counter_label, counter_buf);
+	} else {
+		lv_label_set_text(counter_label, "Syncing...");
+	}
+	lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
 
 	lv_timer_handler();
 	ret = display_blanking_off(display);
 	if (ret < 0 && ret != -ENOSYS) {
 		LOG_ERR("display blanking off failed (%d)", ret);
 		return 0;
+	}
+
+	/* Configure sleep button */
+	if (!gpio_is_ready_dt(&sleep_btn)) {
+		LOG_ERR("Sleep button GPIO not ready");
+	} else {
+		gpio_pin_configure_dt(&sleep_btn, GPIO_INPUT);
+		/* If we just woke from deep sleep the button may still be held;
+		 * wait for release before arming the interrupt. */
+		while (gpio_pin_get_dt(&sleep_btn)) {
+			k_sleep(K_MSEC(50));
+		}
+		k_sleep(K_MSEC(200)); /* debounce */
+		gpio_pin_interrupt_configure_dt(&sleep_btn,
+						GPIO_INT_EDGE_TO_ACTIVE);
+		gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
+				   BIT(sleep_btn.pin));
+		gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
 	}
 
 	/* Register WiFi callback and kick off initial sync */
@@ -385,6 +454,14 @@ int main(void)
 	uint32_t last_elapsed = UINT32_MAX;
 
 	while (1) {
+		/* Sleep on button press or auto-sleep timeout */
+		if (sleep_requested || boot_time_seconds >= AUTO_SLEEP_SECONDS) {
+			if (sleep_requested) {
+				k_sleep(K_MSEC(50)); /* debounce */
+			}
+			enter_sleep(display);
+		}
+
 		/* Update display only when value changes (avoids redundant SPI writes) */
 		if (rtc_has_time) {
 			uint32_t elapsed = calculate_elapsed_seconds();
@@ -398,11 +475,19 @@ int main(void)
 
 		/* Drive the WiFi/NTP state machine */
 		if (sync_state != SYNC_IDLE && sync_state != SYNC_DONE) {
-			lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
 			if (sync_tick()) {
 				lv_label_set_text(wifi_label, "");
 				if (ntp_synced) {
 					rtc_has_time = true;
+					/* Immediately show correct elapsed time */
+					uint32_t elapsed =
+						calculate_elapsed_seconds();
+					last_elapsed = elapsed;
+					snprintf(counter_buf,
+						 sizeof(counter_buf), "%u",
+						 elapsed);
+					lv_label_set_text(counter_label,
+							  counter_buf);
 				}
 			}
 		}
@@ -412,6 +497,7 @@ int main(void)
 		    (boot_time_seconds % RTC_CHECK_INTERVAL) == 0 &&
 		    boot_time_seconds != last_rtc_check) {
 			last_rtc_check = boot_time_seconds;
+			lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
 			sync_start();
 		}
 
