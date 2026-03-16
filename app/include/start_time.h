@@ -19,8 +19,8 @@ static const struct rtc_time START_TIME = {
 	.tm_year = 125,    /* 2025 (2025 - 1900) */
 	.tm_mon = 4,       /* May (1-12 converted to 0-11 for struct) */
 	.tm_mday = 15,     /* Day 15 */
-	.tm_hour = 21,     /* 21:45 German time (CEST) */
-	.tm_min = 45,
+	.tm_hour = 22,     /* 22:00 German time (CEST) */
+	.tm_min = 0,
 	.tm_sec = 0,
 	.tm_wday = 3,      /* Wednesday (0=Sunday, 3=Wednesday) */
 	.tm_yday = 0,      /* Day of year (auto-calculated) */
