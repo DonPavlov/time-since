@@ -16,6 +16,7 @@ target_sources(app PRIVATE
   src/power.c
   src/04b_03.c
   src/icons.c
+  src/spleen.c
 )
 target_include_directories(app PRIVATE include)
 
