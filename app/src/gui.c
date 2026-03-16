@@ -20,7 +20,7 @@ void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed)
 	ctx->counter_buf[0] = '\0';
 
 	lv_style_init(&ctx->counter_label_style);
-	lv_style_set_text_font(&ctx->counter_label_style, &lv_font_font04b03);
+	lv_style_set_text_font(&ctx->counter_label_style, &lv_font_spleen);
 
 	ctx->counter_label = lv_label_create(lv_screen_active());
 	lv_obj_add_style(ctx->counter_label, &ctx->counter_label_style, 0);

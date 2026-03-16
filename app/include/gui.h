@@ -8,6 +8,8 @@
 
 LV_FONT_DECLARE(lv_font_font04b03);
 LV_FONT_DECLARE(lv_font_icons);
+LV_FONT_DECLARE(lv_font_spleen);
+
 
 struct gui_ctx {
 	lv_obj_t *counter_label;
