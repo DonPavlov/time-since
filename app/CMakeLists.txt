@@ -9,7 +9,14 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(app LANGUAGES C)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+  src/main.c
+  src/gui.c
+  src/wifi.c
+  src/power.c
+  src/04b_03.c
+  src/icons.c
+)
 target_include_directories(app PRIVATE include)
 
 # The code below locates the git index file for this repository and adds it as a dependency for

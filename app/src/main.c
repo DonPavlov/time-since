@@ -3,8 +3,8 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h> /* for abs() */
 #include <time.h>
 
 #include <lvgl.h>
@@ -12,188 +12,90 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/kernel.h>
-#include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/wifi_mgmt.h>
-#include <zephyr/net/net_if.h>
-#include <zephyr/net/net_core.h>
-#include <zephyr/net/net_event.h>
-#include <zephyr/net/sntp.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/reboot.h>
 
+#include "gui.h"
+#include "power.h"
 #include "start_time.h"
-#include "wifi_creds.h"
+#include "wifi.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
-/* Global state */
-static bool wifi_connected = false;
-static bool ntp_synced = false;
-static uint32_t boot_time_seconds = 0;
-static uint32_t last_rtc_check = 0;
-static const uint32_t RTC_CHECK_INTERVAL = 300; /* 5 minutes in seconds */
-static const uint32_t AUTO_SLEEP_SECONDS = 180; /* auto-sleep after 3 minutes */
-static struct net_mgmt_event_callback wifi_cb;
-static struct net_mgmt_event_callback ipv4_cb;
-static size_t wifi_network_idx = 0;
+static const uint32_t RTC_CHECK_INTERVAL = 300;
+static const uint32_t AUTO_SLEEP_SECONDS = 180;
 
 /* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
 static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback sleep_btn_cb_data;
 static volatile bool sleep_requested;
+static bool sleep_btn_armed;
+static bool sleep_btn_ready;
 
-static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
-				uint64_t mgmt_event, struct net_if *iface)
+static uint32_t boot_time_seconds;
+static uint32_t last_rtc_check;
+
+static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
+			      uint32_t pins)
 {
-	if (mgmt_event == NET_EVENT_WIFI_CONNECT_RESULT) {
-		const struct wifi_status *status = (const struct wifi_status *)cb->info;
-		if (status->status == 0) {
-			LOG_INF("WiFi connected successfully");
-			wifi_connected = true;
-		} else {
-			LOG_ERR("WiFi connection failed: %d", status->status);
-			wifi_connected = false;
-			wifi_network_idx++;
-		}
-	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
-		LOG_INF("WiFi disconnected");
-		wifi_connected = false;
-	}
+	sleep_requested = true;
 }
 
-static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
-			      uint64_t mgmt_event, struct net_if *iface)
+static void arm_sleep_button_if_released(void)
 {
-	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-		char buf[16];
-		const struct in_addr *addr = net_if_ipv4_get_global_addr(iface,
-							NET_ADDR_PREFERRED);
-		if (addr) {
-			net_addr_ntop(AF_INET, addr, buf, sizeof(buf));
-			LOG_INF("IP address obtained: %s", buf);
-		} else {
-			LOG_INF("IP address assigned");
-		}
-	}
-}
-
-static void start_wifi_connect(void)
-{
-	struct net_if *iface = net_if_get_default();
-	struct wifi_connect_req_params wifi_params = { 0 };
-
-	if (!iface || wifi_connected) {
+	if (!sleep_btn_ready || sleep_btn_armed) {
 		return;
 	}
 
-	if (wifi_network_idx >= KNOWN_NETWORKS_COUNT) {
-		wifi_network_idx = 0;
+	int pin_val = gpio_pin_get_dt(&sleep_btn);
+	if (pin_val < 0) {
+		return;
 	}
 
-	const struct wifi_network *net = &known_networks[wifi_network_idx];
-
-	wifi_params.ssid = net->ssid;
-	wifi_params.ssid_length = strlen(net->ssid);
-	wifi_params.psk = net->password;
-	wifi_params.psk_length = strlen(net->password);
-	wifi_params.security = WIFI_SECURITY_TYPE_PSK;
-	wifi_params.channel = WIFI_CHANNEL_ANY;
-
-	LOG_INF("Attempting to connect to WiFi: %s", net->ssid);
-	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params,
-			 sizeof(struct wifi_connect_req_params));
-	if (ret != 0) {
-		LOG_ERR("WiFi connect request failed: %d", ret);
-		wifi_network_idx++;
+	if (pin_val == 0) {
+		k_sleep(K_MSEC(50));
+		if (gpio_pin_get_dt(&sleep_btn) == 0) {
+			gpio_pin_interrupt_configure_dt(&sleep_btn,
+							GPIO_INT_EDGE_TO_ACTIVE);
+			gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
+					   BIT(sleep_btn.pin));
+			gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
+			sleep_btn_armed = true;
+		}
 	}
 }
 
-/* Try a single NTP sync attempt (non-blocking-friendly, short timeout) */
-static int try_ntp_sync(void)
+static void enter_sleep(const struct device *display)
 {
-	struct sntp_time sntp_time;
-	int ret;
+	LOG_INF("Entering sleep...");
 
-	LOG_INF("Trying NTP sync...");
-	ret = sntp_simple("time.cloudflare.com", 2000, &sntp_time);
-	if (ret < 0) {
-		LOG_WRN("NTP failed: %d", ret);
-		return ret;
+	display_blanking_on(display);
+	wifi_disconnect();
+
+	if (!sleep_btn_ready) {
+		sys_reboot(SYS_REBOOT_COLD);
+		return;
 	}
 
-	/* Apply Europe/Berlin timezone offset (CET=UTC+1, CEST=UTC+2) */
-	time_t ts = (time_t)sntp_time.seconds;
-	struct tm *utc = gmtime(&ts);
-	if (utc == NULL) {
-		return -1;
+	if (sleep_btn_armed) {
+		gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_DISABLE);
 	}
 
-	/* DST: last Sunday of March 02:00 UTC to last Sunday of October 03:00 UTC */
-	bool is_dst = false;
-	if (utc->tm_mon > 2 && utc->tm_mon < 9) {
-		/* April through September: always CEST */
-		is_dst = true;
-	} else if (utc->tm_mon == 2) {
-		/* March: CEST after last Sunday at 02:00 UTC */
-		int last_sun = 31 - ((5 + utc->tm_year + utc->tm_year / 4) % 7);
-		if (utc->tm_mday > last_sun ||
-		    (utc->tm_mday == last_sun && utc->tm_hour >= 2)) {
-			is_dst = true;
-		}
-	} else if (utc->tm_mon == 9) {
-		/* October: CET after last Sunday at 03:00 UTC */
-		int last_sun = 31 - ((2 + utc->tm_year + utc->tm_year / 4) % 7);
-		if (utc->tm_mday < last_sun ||
-		    (utc->tm_mday == last_sun && utc->tm_hour < 3)) {
-			is_dst = true;
-		}
+	while (gpio_pin_get_dt(&sleep_btn)) {
+		k_sleep(K_MSEC(20));
+	}
+	k_sleep(K_MSEC(80));
+
+	while (!gpio_pin_get_dt(&sleep_btn)) {
+		k_sleep(K_MSEC(50));
 	}
 
-	ts += is_dst ? 7200 : 3600;
-	struct tm *local = gmtime(&ts);
-	if (local == NULL) {
-		return -1;
-	}
-
-	LOG_INF("Timezone: %s (UTC%s)", is_dst ? "CEST" : "CET",
-		is_dst ? "+2" : "+1");
-
-	struct rtc_time rtc_time = {
-		.tm_year = local->tm_year,
-		.tm_mon = local->tm_mon,
-		.tm_mday = local->tm_mday,
-		.tm_hour = local->tm_hour,
-		.tm_min = local->tm_min,
-		.tm_sec = local->tm_sec,
-		.tm_wday = local->tm_wday,
-	};
-
-	if (device_is_ready(rtc)) {
-		ret = rtc_set_time(rtc, &rtc_time);
-		if (ret == 0) {
-			LOG_INF("Online time: %04d-%02d-%02d %02d:%02d:%02d",
-				rtc_time.tm_year + 1900, rtc_time.tm_mon + 1,
-				rtc_time.tm_mday, rtc_time.tm_hour,
-				rtc_time.tm_min, rtc_time.tm_sec);
-			/* Read back RTC to confirm */
-			struct rtc_time readback = { 0 };
-			if (rtc_get_time(rtc, &readback) == 0) {
-				LOG_INF("Device time: %04d-%02d-%02d %02d:%02d:%02d",
-					readback.tm_year + 1900,
-					readback.tm_mon + 1,
-					readback.tm_mday, readback.tm_hour,
-					readback.tm_min, readback.tm_sec);
-			}
-			return 0;
-		}
-	}
-
-	return ret;
+	sys_reboot(SYS_REBOOT_COLD);
 }
 
 static time_t rtc_time_to_epoch(const struct rtc_time *t)
@@ -209,11 +111,33 @@ static time_t rtc_time_to_epoch(const struct rtc_time *t)
 	return mktime(&tm_val);
 }
 
-static uint32_t calculate_elapsed_seconds(void)
+static bool rtc_has_valid_time(void)
+{
+	if (!device_is_ready(rtc)) {
+		return false;
+	}
+
+	struct rtc_time rtc_check = { 0 };
+	if (rtc_get_time(rtc, &rtc_check) != 0) {
+		return false;
+	}
+
+	time_t now_epoch = rtc_time_to_epoch(&rtc_check);
+	time_t start_epoch = rtc_time_to_epoch(&START_TIME);
+	if (now_epoch <= start_epoch) {
+		return false;
+	}
+
+	LOG_INF("RTC has valid time: %02d:%02d:%02d",
+		rtc_check.tm_hour, rtc_check.tm_min, rtc_check.tm_sec);
+	return true;
+}
+
+static uint32_t calculate_elapsed_seconds(bool use_rtc)
 {
 	struct rtc_time now = { 0 };
 
-	if (device_is_ready(rtc) && rtc_get_time(rtc, &now) == 0) {
+	if (use_rtc && device_is_ready(rtc) && rtc_get_time(rtc, &now) == 0) {
 		time_t now_epoch = rtc_time_to_epoch(&now);
 		time_t start_epoch = rtc_time_to_epoch(&START_TIME);
 
@@ -223,282 +147,87 @@ static uint32_t calculate_elapsed_seconds(void)
 		return 0;
 	}
 
-	/* If RTC not available, use boot time counter */
 	return boot_time_seconds;
-}
-
-static void disconnect_wifi(void)
-{
-	struct net_if *iface = net_if_get_default();
-
-	if (!iface || !wifi_connected) {
-		return;
-	}
-
-	int ret = net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
-	if (ret != 0) {
-		LOG_ERR("WiFi disconnect failed: %d", ret);
-	}
-	wifi_connected = false;
-}
-
-/* WiFi/NTP state machine states */
-enum sync_state {
-	SYNC_IDLE,
-	SYNC_CONNECTING,
-	SYNC_NTP,
-	SYNC_DONE,
-};
-
-static enum sync_state sync_state = SYNC_IDLE;
-static uint32_t sync_timer = 0;
-static int ntp_attempts = 0;
-
-static void sync_start(void)
-{
-	sync_state = SYNC_CONNECTING;
-	sync_timer = 0;
-	ntp_attempts = 0;
-	wifi_network_idx = 0;
-	start_wifi_connect();
-}
-
-/* Called once per second from main loop. Returns true when sync complete. */
-static bool sync_tick(void)
-{
-	sync_timer++;
-
-	switch (sync_state) {
-	case SYNC_IDLE:
-		break;
-
-	case SYNC_CONNECTING:
-		if (wifi_connected) {
-			/* Wait a few seconds for DHCP before first NTP attempt */
-			if (sync_timer >= 5) {
-				LOG_INF("Trying NTP...");
-				sync_state = SYNC_NTP;
-				sync_timer = 0;
-			}
-		} else if (sync_timer >= 10) {
-			wifi_network_idx++;
-			if (wifi_network_idx >= KNOWN_NETWORKS_COUNT * 3) {
-				LOG_WRN("WiFi connect failed after trying all networks");
-				sync_state = SYNC_DONE;
-				return true;
-			}
-			start_wifi_connect();
-			sync_timer = 0;
-		}
-		break;
-
-	case SYNC_NTP:
-		/* Try NTP every 3 seconds */
-		if (sync_timer >= 3) {
-			sync_timer = 0;
-			if (try_ntp_sync() == 0) {
-				ntp_synced = true;
-				disconnect_wifi();
-				sync_state = SYNC_DONE;
-				return true;
-			}
-			ntp_attempts++;
-			if (ntp_attempts >= 10) {
-				LOG_WRN("NTP failed after %d attempts, giving up",
-					ntp_attempts);
-				disconnect_wifi();
-				sync_state = SYNC_DONE;
-				return true;
-			}
-		}
-		break;
-
-	case SYNC_DONE:
-		break;
-	}
-
-	return false;
-}
-
-static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
-			      uint32_t pins)
-{
-	sleep_requested = true;
-}
-
-static void enter_sleep(const struct device *display)
-{
-	LOG_INF("Entering sleep...");
-
-	/* Turn off OLED */
-	display_blanking_on(display);
-
-	/* Disconnect WiFi if active */
-	disconnect_wifi();
-
-	/* Disable button interrupt while we poll for wake */
-	gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_DISABLE);
-
-	/* Wait for button release (it was just pressed or auto-sleep fired) */
-	while (gpio_pin_get_dt(&sleep_btn)) {
-		k_sleep(K_MSEC(50));
-	}
-	k_sleep(K_MSEC(200)); /* debounce */
-
-	/* Idle-loop until next button press.
-	 * Display and WiFi are off; CPU enters WFI between polls. */
-	while (!gpio_pin_get_dt(&sleep_btn)) {
-		k_sleep(K_SECONDS(1));
-	}
-
-	/* Cold reboot gives a clean restart — RTC retains the time */
-	sys_reboot(SYS_REBOOT_COLD);
 }
 
 int main(void)
 {
-	char counter_buf[32] = { 0 };
 	const struct device *display;
-	lv_obj_t *counter_label;
-	lv_obj_t *wifi_label;
-	lv_style_t counter_label_style;
-	lv_style_t wifi_label_style;
+	struct gui_ctx gui;
 	bool rtc_has_time = false;
 	int ret;
 
 	LOG_INF("main() started");
 
-	/* Initialize display */
 	display = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 	if (display == NULL || !device_is_ready(display)) {
 		LOG_ERR("display not ready");
 		return 0;
 	}
 
-	/* Check if RTC already has valid time */
-	if (device_is_ready(rtc)) {
-		struct rtc_time rtc_check = { 0 };
-		if (rtc_get_time(rtc, &rtc_check) == 0) {
-			time_t now_epoch = rtc_time_to_epoch(&rtc_check);
-			time_t start_epoch = rtc_time_to_epoch(&START_TIME);
-			if (now_epoch > start_epoch) {
-				LOG_INF("RTC has valid time: %02d:%02d:%02d",
-					rtc_check.tm_hour, rtc_check.tm_min,
-					rtc_check.tm_sec);
-				rtc_has_time = true;
-			}
-		}
-	}
+	rtc_has_time = rtc_has_valid_time();
 
-	/* Create UI */
-	lv_style_init(&counter_label_style);
-	lv_style_set_text_font(&counter_label_style, &lv_font_montserrat_14);
-
-	counter_label = lv_label_create(lv_screen_active());
-	lv_obj_add_style(counter_label, &counter_label_style, 0);
-	lv_obj_align(counter_label, LV_ALIGN_CENTER, 0, 0);
-
-	lv_style_init(&wifi_label_style);
-	lv_style_set_text_font(&wifi_label_style, &lv_font_montserrat_10);
-
-	wifi_label = lv_label_create(lv_screen_active());
-	lv_obj_add_style(wifi_label, &wifi_label_style, 0);
-	lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_RIGHT, -2, -3);
-
-	/* Show content on the very first frame — never boot to a blank screen */
-	if (rtc_has_time) {
-		uint32_t elapsed = calculate_elapsed_seconds();
-		snprintf(counter_buf, sizeof(counter_buf), "%u", elapsed);
-		lv_label_set_text(counter_label, counter_buf);
-	} else {
-		lv_label_set_text(counter_label, "Syncing...");
-	}
-	lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
-
+	gui_init(&gui, rtc_has_time,
+		 calculate_elapsed_seconds(rtc_has_time));
 	lv_timer_handler();
+
 	ret = display_blanking_off(display);
 	if (ret < 0 && ret != -ENOSYS) {
 		LOG_ERR("display blanking off failed (%d)", ret);
 		return 0;
 	}
 
-	/* Configure sleep button */
 	if (!gpio_is_ready_dt(&sleep_btn)) {
 		LOG_ERR("Sleep button GPIO not ready");
 	} else {
 		gpio_pin_configure_dt(&sleep_btn, GPIO_INPUT);
-		/* If we just woke from deep sleep the button may still be held;
-		 * wait for release before arming the interrupt. */
-		while (gpio_pin_get_dt(&sleep_btn)) {
-			k_sleep(K_MSEC(50));
-		}
-		k_sleep(K_MSEC(200)); /* debounce */
-		gpio_pin_interrupt_configure_dt(&sleep_btn,
-						GPIO_INT_EDGE_TO_ACTIVE);
-		gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
-				   BIT(sleep_btn.pin));
-		gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
+		sleep_btn_armed = false;
+		sleep_btn_ready = true;
 	}
 
-	/* Register WiFi callback and kick off initial sync */
-	net_mgmt_init_event_callback(&wifi_cb, wifi_connect_handler,
-				     NET_EVENT_WIFI_CONNECT_RESULT |
-				     NET_EVENT_WIFI_DISCONNECT_RESULT);
-	net_mgmt_add_event_callback(&wifi_cb);
+	power_init();
 
-	net_mgmt_init_event_callback(&ipv4_cb, ipv4_addr_handler,
-				     NET_EVENT_IPV4_ADDR_ADD);
-	net_mgmt_add_event_callback(&ipv4_cb);
-	sync_start();
-
-	uint32_t last_elapsed = UINT32_MAX;
+	wifi_module_init();
+	gui_set_wifi_active(&gui, true);
+	wifi_sync_start();
 
 	while (1) {
-		/* Sleep on button press or auto-sleep timeout */
-		if (sleep_requested || boot_time_seconds >= AUTO_SLEEP_SECONDS) {
-			if (sleep_requested) {
-				k_sleep(K_MSEC(50)); /* debounce */
+		bool usb_present = power_usb_present();
+
+		arm_sleep_button_if_released();
+
+		if (sleep_requested) {
+			if (usb_present) {
+				sleep_requested = false;
+			} else {
+				k_sleep(K_MSEC(50));
+				enter_sleep(display);
 			}
+		}
+
+		if (!usb_present && boot_time_seconds >= AUTO_SLEEP_SECONDS) {
 			enter_sleep(display);
 		}
 
-		/* Update display only when value changes (avoids redundant SPI writes) */
-		if (rtc_has_time) {
-			uint32_t elapsed = calculate_elapsed_seconds();
-			if (elapsed != last_elapsed) {
-				last_elapsed = elapsed;
-				snprintf(counter_buf, sizeof(counter_buf), "%u",
-					 elapsed);
-				lv_label_set_text(counter_label, counter_buf);
-			}
-		}
+		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
 
-		/* Drive the WiFi/NTP state machine */
-		if (sync_state != SYNC_IDLE && sync_state != SYNC_DONE) {
-			if (sync_tick()) {
-				lv_label_set_text(wifi_label, "");
-				if (ntp_synced) {
+		if (wifi_sync_in_progress()) {
+			if (wifi_sync_tick()) {
+				gui_set_wifi_active(&gui, false);
+				if (wifi_ntp_synced()) {
 					rtc_has_time = true;
-					/* Immediately show correct elapsed time */
-					uint32_t elapsed =
-						calculate_elapsed_seconds();
-					last_elapsed = elapsed;
-					snprintf(counter_buf,
-						 sizeof(counter_buf), "%u",
-						 elapsed);
-					lv_label_set_text(counter_label,
-							  counter_buf);
+					gui_set_counter(&gui,
+							calculate_elapsed_seconds(true));
 				}
 			}
 		}
 
-		/* Periodic re-sync every 5 minutes */
-		if (sync_state == SYNC_DONE &&
+		if (wifi_sync_done() &&
 		    (boot_time_seconds % RTC_CHECK_INTERVAL) == 0 &&
 		    boot_time_seconds != last_rtc_check) {
 			last_rtc_check = boot_time_seconds;
-			lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
-			sync_start();
+			gui_set_wifi_active(&gui, true);
+			wifi_sync_start();
 		}
 
 		lv_timer_handler();
