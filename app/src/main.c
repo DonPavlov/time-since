@@ -16,11 +16,10 @@
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/reboot.h>
 
 #include "gui.h"
 #include "power.h"
-#include "start_time.h"
+#include "time_utils.h"
 #include "wifi.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
@@ -57,14 +56,11 @@ static void arm_sleep_button_if_released(void)
 		return;
 	}
 
-	if (pin_val == 0) {
+	if (pin_val != 0) {
 		k_sleep(K_MSEC(50));
-		if (gpio_pin_get_dt(&sleep_btn) == 0) {
+		if (gpio_pin_get_dt(&sleep_btn) != 0) {
 			gpio_pin_interrupt_configure_dt(&sleep_btn,
 							GPIO_INT_EDGE_TO_ACTIVE);
-			gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
-					   BIT(sleep_btn.pin));
-			gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
 			sleep_btn_armed = true;
 		}
 	}
@@ -78,7 +74,6 @@ static void enter_sleep(const struct device *display)
 	wifi_disconnect();
 
 	if (!sleep_btn_ready) {
-		sys_reboot(SYS_REBOOT_COLD);
 		return;
 	}
 
@@ -86,29 +81,12 @@ static void enter_sleep(const struct device *display)
 		gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_DISABLE);
 	}
 
-	while (gpio_pin_get_dt(&sleep_btn)) {
-		k_sleep(K_MSEC(20));
-	}
-	k_sleep(K_MSEC(80));
-
 	while (!gpio_pin_get_dt(&sleep_btn)) {
 		k_sleep(K_MSEC(50));
 	}
 
-	sys_reboot(SYS_REBOOT_COLD);
-}
-
-static time_t rtc_time_to_epoch(const struct rtc_time *t)
-{
-	struct tm tm_val = {
-		.tm_year = t->tm_year,
-		.tm_mon = t->tm_mon,
-		.tm_mday = t->tm_mday,
-		.tm_hour = t->tm_hour,
-		.tm_min = t->tm_min,
-		.tm_sec = t->tm_sec,
-	};
-	return mktime(&tm_val);
+	k_sleep(K_MSEC(80));
+	(void)power_enter_deep_sleep(&sleep_btn);
 }
 
 static bool rtc_has_valid_time(void)
@@ -118,12 +96,14 @@ static bool rtc_has_valid_time(void)
 	}
 
 	struct rtc_time rtc_check = { 0 };
+	time_t now_epoch;
+	time_t start_epoch = time_utils_start_epoch_utc();
+
 	if (rtc_get_time(rtc, &rtc_check) != 0) {
 		return false;
 	}
 
-	time_t now_epoch = rtc_time_to_epoch(&rtc_check);
-	time_t start_epoch = rtc_time_to_epoch(&START_TIME);
+	now_epoch = time_utils_rtc_to_epoch_utc(&rtc_check);
 	if (now_epoch <= start_epoch) {
 		return false;
 	}
@@ -136,10 +116,11 @@ static bool rtc_has_valid_time(void)
 static uint32_t calculate_elapsed_seconds(bool use_rtc)
 {
 	struct rtc_time now = { 0 };
+	time_t now_epoch;
+	time_t start_epoch = time_utils_start_epoch_utc();
 
 	if (use_rtc && device_is_ready(rtc) && rtc_get_time(rtc, &now) == 0) {
-		time_t now_epoch = rtc_time_to_epoch(&now);
-		time_t start_epoch = rtc_time_to_epoch(&START_TIME);
+		now_epoch = time_utils_rtc_to_epoch_utc(&now);
 
 		if (now_epoch > start_epoch) {
 			return (uint32_t)(now_epoch - start_epoch);
@@ -181,6 +162,9 @@ int main(void)
 		LOG_ERR("Sleep button GPIO not ready");
 	} else {
 		gpio_pin_configure_dt(&sleep_btn, GPIO_INPUT);
+		gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
+				   BIT(sleep_btn.pin));
+		gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
 		sleep_btn_armed = false;
 		sleep_btn_ready = true;
 	}
@@ -214,12 +198,14 @@ int main(void)
 		if (wifi_sync_in_progress()) {
 			if (wifi_sync_tick()) {
 				gui_set_wifi_active(&gui, false);
-				if (wifi_ntp_synced()) {
+				if (wifi_rtc_updated()) {
 					rtc_has_time = true;
-					gui_set_counter(&gui,
-							calculate_elapsed_seconds(true));
 				}
 			}
+		}
+
+		if (rtc_has_time) {
+			gui_set_counter(&gui, calculate_elapsed_seconds(true));
 		}
 
 		if (wifi_sync_done() &&

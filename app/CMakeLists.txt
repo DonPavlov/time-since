@@ -12,6 +12,7 @@ project(app LANGUAGES C)
 target_sources(app PRIVATE
   src/main.c
   src/gui.c
+  src/time_utils.c
   src/wifi.c
   src/power.c
   src/04b_03.c
