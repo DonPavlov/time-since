@@ -30,8 +30,8 @@ west twister -T tests --integration
 
 ## Architecture
 
-The app has a single source file (`app/src/main.c`) with this flow:
-1. Initialize display via LVGL — immediately shows elapsed time (from RTC) or "Syncing..."
+The app has this flow:
+1. Initialize display via LVGL — immediately shows elapsed time (from RTC)
 2. Check RTC for existing time (PCF8563 retains time across deep sleep)
 3. Configure sleep button (GPIO0 / D0 pin — wire button between D0 and GND)
 4. Connect to WiFi (tries each entry in `known_networks[]`)
@@ -43,12 +43,3 @@ The app has a single source file (`app/src/main.c`) with this flow:
 - **Sleep triggers**: button press on GPIO0, or auto-sleep after 3 minutes
 - **Wake trigger**: button press on GPIO0 (deep-sleep GPIO wakeup)
 - Deep sleep powers off the SoC; the external PCF8563 RTC keeps time
-- On wake the device does a full reset: display shows time immediately from RTC, then NTP re-syncs in background
-
-### Console / Logging
-
-UART console is **disabled** (`CONFIG_UART_CONSOLE=n`) so the device boots without a USB host. To re-enable for debugging, set `CONFIG_UART_CONSOLE=y`, `CONFIG_LOG_BACKEND_UART=y`, `CONFIG_SERIAL=y`, and `CONFIG_CONSOLE=y` in `app/prj.conf`. Use `CONFIG_LOG_MODE_DEFERRED=y` (never IMMEDIATE) to avoid blocking on USB.
-
-Elapsed time is computed as `(current RTC time) - START_TIME` in seconds. Falls back to `boot_time_seconds` counter if RTC is unavailable.
-
-The repository structure includes scaffolding from the Zephyr example-application template (out-of-tree drivers, libs, custom west commands) — most of this scaffolding (`drivers/`, `lib/`, `scripts/`) is not used by the actual app logic.
