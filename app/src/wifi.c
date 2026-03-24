@@ -18,12 +18,14 @@
 #include <zephyr/net/sntp.h>
 #include <zephyr/net/wifi_mgmt.h>
 
+#include "time_utils.h"
+
 LOG_MODULE_REGISTER(wifi, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
 static bool wifi_connected;
-static bool ntp_synced;
+static bool rtc_updated;
 static size_t wifi_network_idx;
 
 static struct net_mgmt_event_callback wifi_cb;
@@ -112,6 +114,9 @@ static void start_wifi_connect(void)
 static int try_ntp_sync(void)
 {
 	struct sntp_time sntp_time;
+	struct tm *utc;
+	struct rtc_time rtc_time;
+	time_t ts;
 	int ret;
 
 	LOG_INF("Trying NTP sync...");
@@ -121,68 +126,54 @@ static int try_ntp_sync(void)
 		return ret;
 	}
 
-	/* Apply Europe/Berlin timezone offset (CET=UTC+1, CEST=UTC+2) */
-	time_t ts = (time_t)sntp_time.seconds;
-	struct tm *utc = gmtime(&ts);
+	ts = (time_t)sntp_time.seconds;
+	utc = gmtime(&ts);
 	if (utc == NULL) {
 		return -1;
 	}
 
-	/* DST: last Sunday of March 02:00 UTC to last Sunday of October 03:00 UTC */
-	bool is_dst = false;
-	if (utc->tm_mon > 2 && utc->tm_mon < 9) {
-		/* April through September: always CEST */
-		is_dst = true;
-	} else if (utc->tm_mon == 2) {
-		/* March: CEST after last Sunday at 02:00 UTC */
-		int last_sun = 31 - ((5 + utc->tm_year + utc->tm_year / 4) % 7);
-		if (utc->tm_mday > last_sun ||
-		    (utc->tm_mday == last_sun && utc->tm_hour >= 2)) {
-			is_dst = true;
-		}
-	} else if (utc->tm_mon == 9) {
-		/* October: CET after last Sunday at 03:00 UTC */
-		int last_sun = 31 - ((2 + utc->tm_year + utc->tm_year / 4) % 7);
-		if (utc->tm_mday < last_sun ||
-		    (utc->tm_mday == last_sun && utc->tm_hour < 3)) {
-			is_dst = true;
-		}
-	}
-
-	ts += is_dst ? 7200 : 3600;
-	struct tm *local = gmtime(&ts);
-	if (local == NULL) {
-		return -1;
-	}
-
-	LOG_INF("Timezone: %s (UTC%s)", is_dst ? "CEST" : "CET",
-		is_dst ? "+2" : "+1");
-
-	struct rtc_time rtc_time = {
-		.tm_year = local->tm_year,
-		.tm_mon = local->tm_mon,
-		.tm_mday = local->tm_mday,
-		.tm_hour = local->tm_hour,
-		.tm_min = local->tm_min,
-		.tm_sec = local->tm_sec,
-		.tm_wday = local->tm_wday,
+	rtc_time = (struct rtc_time) {
+		.tm_year = utc->tm_year,
+		.tm_mon = utc->tm_mon,
+		.tm_mday = utc->tm_mday,
+		.tm_hour = utc->tm_hour,
+		.tm_min = utc->tm_min,
+		.tm_sec = utc->tm_sec,
+		.tm_wday = utc->tm_wday,
+		.tm_yday = utc->tm_yday,
+		.tm_isdst = 0,
 	};
 
 	if (device_is_ready(rtc)) {
 		ret = rtc_set_time(rtc, &rtc_time);
 		if (ret == 0) {
-			LOG_INF("Online time: %04d-%02d-%02d %02d:%02d:%02d",
+			LOG_INF("Stored RTC time in UTC: %04d-%02d-%02d %02d:%02d:%02d",
 				rtc_time.tm_year + 1900, rtc_time.tm_mon + 1,
 				rtc_time.tm_mday, rtc_time.tm_hour,
 				rtc_time.tm_min, rtc_time.tm_sec);
 			struct rtc_time readback = { 0 };
 			if (rtc_get_time(rtc, &readback) == 0) {
-				LOG_INF("Device time: %04d-%02d-%02d %02d:%02d:%02d",
+				time_t readback_epoch = time_utils_rtc_to_epoch_utc(&readback);
+				bool berlin_dst = time_utils_berlin_is_dst_utc(readback_epoch);
+				int berlin_offset = berlin_dst ? 7200 : 3600;
+				time_t berlin_epoch = readback_epoch + berlin_offset;
+				struct tm *berlin = gmtime(&berlin_epoch);
+
+				LOG_INF("Device RTC UTC: %04d-%02d-%02d %02d:%02d:%02d",
 					readback.tm_year + 1900,
 					readback.tm_mon + 1,
 					readback.tm_mday, readback.tm_hour,
 					readback.tm_min, readback.tm_sec);
+				if (berlin != NULL) {
+					LOG_INF("Berlin wall time: %04d-%02d-%02d %02d:%02d:%02d (%s)",
+						berlin->tm_year + 1900,
+						berlin->tm_mon + 1,
+						berlin->tm_mday, berlin->tm_hour,
+						berlin->tm_min, berlin->tm_sec,
+						berlin_dst ? "CEST" : "CET");
+				}
 			}
+			rtc_updated = true;
 			return 0;
 		}
 	}
@@ -207,6 +198,7 @@ void wifi_sync_start(void)
 	sync_state = SYNC_CONNECTING;
 	sync_timer = 0;
 	ntp_attempts = 0;
+	rtc_updated = false;
 	wifi_network_idx = 0;
 	start_wifi_connect();
 }
@@ -242,7 +234,6 @@ bool wifi_sync_tick(void)
 		if (sync_timer >= 3) {
 			sync_timer = 0;
 			if (try_ntp_sync() == 0) {
-				ntp_synced = true;
 				wifi_disconnect();
 				sync_state = SYNC_DONE;
 				return true;
@@ -275,9 +266,9 @@ bool wifi_sync_done(void)
 	return sync_state == SYNC_DONE;
 }
 
-bool wifi_ntp_synced(void)
+bool wifi_rtc_updated(void)
 {
-	return ntp_synced;
+	return rtc_updated;
 }
 
 void wifi_disconnect(void)

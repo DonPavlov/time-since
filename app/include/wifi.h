@@ -9,7 +9,7 @@ void wifi_sync_start(void);
 bool wifi_sync_tick(void);
 bool wifi_sync_in_progress(void);
 bool wifi_sync_done(void);
-bool wifi_ntp_synced(void);
+bool wifi_rtc_updated(void);
 
 void wifi_disconnect(void);
 
