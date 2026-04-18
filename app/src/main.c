@@ -26,7 +26,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
-static const uint32_t RTC_CHECK_INTERVAL = 300;
+static const uint32_t WIFI_RESYNC_INTERVAL = 300;
 static const uint32_t AUTO_SLEEP_SECONDS = 180;
 
 /* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
@@ -37,7 +37,7 @@ static bool sleep_btn_armed;
 static bool sleep_btn_ready;
 
 static uint32_t boot_time_seconds;
-static uint32_t last_rtc_check;
+static uint32_t last_wifi_resync;
 
 static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
 			      uint32_t pins)
@@ -193,8 +193,6 @@ int main(void)
 			enter_sleep(display);
 		}
 
-		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
-
 		if (wifi_sync_in_progress()) {
 			if (wifi_sync_tick()) {
 				gui_set_wifi_active(&gui, false);
@@ -204,14 +202,12 @@ int main(void)
 			}
 		}
 
-		if (rtc_has_time) {
-			gui_set_counter(&gui, calculate_elapsed_seconds(true));
-		}
+		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
 
 		if (wifi_sync_done() &&
-		    (boot_time_seconds % RTC_CHECK_INTERVAL) == 0 &&
-		    boot_time_seconds != last_rtc_check) {
-			last_rtc_check = boot_time_seconds;
+		    (boot_time_seconds % WIFI_RESYNC_INTERVAL) == 0 &&
+		    boot_time_seconds != last_wifi_resync) {
+			last_wifi_resync = boot_time_seconds;
 			gui_set_wifi_active(&gui, true);
 			wifi_sync_start();
 		}

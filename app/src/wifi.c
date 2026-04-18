@@ -24,9 +24,9 @@ LOG_MODULE_REGISTER(wifi, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
-static bool wifi_connected;
-static bool rtc_updated;
-static size_t wifi_network_idx;
+static volatile bool wifi_connected;
+static volatile bool rtc_updated;
+static volatile size_t wifi_network_idx;
 
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
@@ -38,7 +38,7 @@ enum sync_state {
 	SYNC_DONE,
 };
 
-static enum sync_state sync_state = SYNC_IDLE;
+static volatile enum sync_state sync_state = SYNC_IDLE;
 static uint32_t sync_timer;
 static int ntp_attempts;
 
@@ -53,7 +53,6 @@ static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
 		} else {
 			LOG_ERR("WiFi connection failed: %d", status->status);
 			wifi_connected = false;
-			wifi_network_idx++;
 		}
 	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
 		LOG_INF("WiFi disconnected");

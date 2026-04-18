@@ -15,7 +15,6 @@ target_sources(app PRIVATE
   src/time_utils.c
   src/wifi.c
   src/power.c
-  src/04b_03.c
   src/icons.c
   src/spleen.c
 )

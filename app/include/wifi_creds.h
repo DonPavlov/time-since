@@ -6,7 +6,9 @@
 /**
  * @brief WiFi network credentials
  *
- * Add or modify networks here to connect to known WiFi networks.
+ * Struct definition lives here. The actual `known_networks[]` array and
+ * `KNOWN_NETWORKS_COUNT` macro live in `secrets.h` (gitignored).
+ * See `secrets.h.example` for the template.
  */
 struct wifi_network {
 	const char *ssid;
@@ -14,16 +16,6 @@ struct wifi_network {
 	enum wifi_security_type security;
 };
 
-/* Known WiFi networks */
-static const struct wifi_network known_networks[] = {
-	{
-		.ssid = "Hein",
-		.password = "paulhein1!",
-		.security = WIFI_SECURITY_TYPE_PSK,
-	},
-	/* Add more networks here as needed */
-};
-
-#define KNOWN_NETWORKS_COUNT (sizeof(known_networks) / sizeof(known_networks[0]))
+#include "secrets.h"
 
 #endif /* WIFI_CREDS_H */

@@ -38,18 +38,10 @@ void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed)
 	gui_set_wifi_active(ctx, true);
 }
 
-void gui_show_syncing(struct gui_ctx *ctx)
-{
-	if (ctx == NULL) {
-		return;
-	}
-
-	lv_label_set_text(ctx->counter_label, "Syncing...");
-}
-
 void gui_set_counter(struct gui_ctx *ctx, uint32_t elapsed)
 {
-	if (ctx == NULL || elapsed == ctx->last_elapsed) {
+	if (ctx == NULL || ctx->counter_label == NULL ||
+	    elapsed == ctx->last_elapsed) {
 		return;
 	}
 
@@ -60,7 +52,7 @@ void gui_set_counter(struct gui_ctx *ctx, uint32_t elapsed)
 
 void gui_set_wifi_active(struct gui_ctx *ctx, bool active)
 {
-	if (ctx == NULL) {
+	if (ctx == NULL || ctx->wifi_label == NULL) {
 		return;
 	}
 

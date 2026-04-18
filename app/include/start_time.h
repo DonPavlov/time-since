@@ -4,27 +4,24 @@
 #include <zephyr/drivers/rtc.h>
 
 /**
- * @brief Start date/time configuration
+ * @brief Start date/time configuration (treated as UTC)
  *
- * Easily change the start date here. Format is:
- * - Year: actual year (e.g., 2025)
- * - Month: 1-12 (where 1 = January)
- * - Day: 1-31
- * - Hour: 0-23
- * - Minute: 0-59
- * - Second: 0-59
+ * Fields:
+ * - tm_year: year since 1900 (2025 -> 125)
+ * - tm_mon:  0-indexed (0=Jan, 4=May, 11=Dec)
+ * - tm_mday: 1-31
+ * - tm_hour: 0-23
+ * - tm_min:  0-59
+ * - tm_sec:  0-59
  */
 
 static const struct rtc_time START_TIME = {
-	.tm_year = 125,    /* 2025 (2025 - 1900) */
-	.tm_mon = 4,       /* May (1-12 converted to 0-11 for struct) */
-	.tm_mday = 15,     /* Day 15 */
-	.tm_hour = 22,     /* 22:00 literal configured clock time */
+	.tm_year = 125,    /* 2025 */
+	.tm_mon = 4,       /* May */
+	.tm_mday = 15,
+	.tm_hour = 22,
 	.tm_min = 0,
 	.tm_sec = 0,
-	.tm_wday = 3,      /* Wednesday (0=Sunday, 3=Wednesday) */
-	.tm_yday = 0,      /* Day of year (auto-calculated) */
-	.tm_isdst = 1      /* Daylight saving time (1 for summer in Germany, 0 for winter) */
 };
 
 #endif /* START_TIME_H */
