@@ -43,11 +43,6 @@
 	};
 };
 
-/* Free GPIO3 for display CS (board default uses it for RF switch enable). */
-&rf_switch {
-	status = "disabled";
-};
-
 &spi2 {
 	status = "okay";
 	pinctrl-0 = <&spi2_oled_pins>;

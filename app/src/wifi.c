@@ -26,6 +26,7 @@ static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
 static volatile bool wifi_connected;
 static volatile bool rtc_updated;
+static volatile bool keep_connected;
 static volatile size_t wifi_network_idx;
 
 static struct net_mgmt_event_callback wifi_cb;
@@ -70,6 +71,7 @@ static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
 		if (addr) {
 			net_addr_ntop(AF_INET, addr, buf, sizeof(buf));
 			LOG_INF("IP address obtained: %s", buf);
+			LOG_INF("Logs: http://%s/ (hostname: time-since-box)", buf);
 		} else {
 			LOG_INF("IP address assigned");
 		}
@@ -95,6 +97,9 @@ static void start_wifi_connect(void)
 	wifi_params.ssid_length = strlen(net->ssid);
 	wifi_params.security = net->security;
 	wifi_params.channel = WIFI_CHANNEL_ANY;
+	wifi_params.band = WIFI_FREQ_BAND_2_4_GHZ;
+	wifi_params.mfp = WIFI_MFP_OPTIONAL;
+	wifi_params.timeout = SYS_FOREVER_MS;
 
 	if (net->security != WIFI_SECURITY_TYPE_NONE && net->password != NULL) {
 		wifi_params.psk = net->password;
@@ -233,7 +238,9 @@ bool wifi_sync_tick(void)
 		if (sync_timer >= 3) {
 			sync_timer = 0;
 			if (try_ntp_sync() == 0) {
-				wifi_disconnect();
+				if (!keep_connected) {
+					wifi_disconnect();
+				}
 				sync_state = SYNC_DONE;
 				return true;
 			}
@@ -241,7 +248,9 @@ bool wifi_sync_tick(void)
 			if (ntp_attempts >= 10) {
 				LOG_WRN("NTP failed after %d attempts, giving up",
 					ntp_attempts);
-				wifi_disconnect();
+				if (!keep_connected) {
+					wifi_disconnect();
+				}
 				sync_state = SYNC_DONE;
 				return true;
 			}
@@ -268,6 +277,11 @@ bool wifi_sync_done(void)
 bool wifi_rtc_updated(void)
 {
 	return rtc_updated;
+}
+
+void wifi_set_keep_connected(bool keep)
+{
+	keep_connected = keep;
 }
 
 void wifi_disconnect(void)

@@ -11,6 +11,12 @@ bool wifi_sync_in_progress(void);
 bool wifi_sync_done(void);
 bool wifi_rtc_updated(void);
 
+/**
+ * When true, NTP success does NOT auto-disconnect WiFi. Used while the
+ * web log server is running so clients can reach it. Default: false.
+ */
+void wifi_set_keep_connected(bool keep);
+
 void wifi_disconnect(void);
 
 #endif /* WIFI_H */

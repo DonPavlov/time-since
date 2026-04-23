@@ -17,8 +17,17 @@ target_sources(app PRIVATE
   src/power.c
   src/icons.c
   src/spleen.c
+  src/log_backend_web.c
+  src/http_log_server.c
 )
 target_include_directories(app PRIVATE include)
+
+# Linker fragment for HTTP_RESOURCE_DEFINE iterable-alternate section
+zephyr_linker_sources(SECTIONS sections-rom.ld)
+zephyr_linker_section(
+  NAME http_resource_desc_log_http_service
+  KVMA RAM_REGION GROUP RODATA_REGION
+)
 
 # The code below locates the git index file for this repository and adds it as a dependency for
 # the application VERSION file so that if the repo has a new commit added, even if no files in

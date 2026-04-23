@@ -18,6 +18,7 @@
 #include <zephyr/logging/log.h>
 
 #include "gui.h"
+#include "http_log_server.h"
 #include "power.h"
 #include "time_utils.h"
 #include "wifi.h"
@@ -27,7 +28,10 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
 static const uint32_t WIFI_RESYNC_INTERVAL = 300;
-static const uint32_t AUTO_SLEEP_SECONDS = 180;
+/* Keep device awake long enough to cover the 5-minute web-log window, then
+ * a bit more so the log viewer is still responsive right up to the cutoff. */
+static const uint32_t AUTO_SLEEP_SECONDS = 360;
+static const uint32_t WEB_LOG_WINDOW_SECONDS = 300;
 
 /* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
 static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -172,8 +176,12 @@ int main(void)
 	power_init();
 
 	wifi_module_init();
+	wifi_set_keep_connected(true);
+	http_log_server_start();
 	gui_set_wifi_active(&gui, true);
 	wifi_sync_start();
+
+	bool web_log_window_closed = false;
 
 	while (1) {
 		bool usb_present = power_usb_present();
@@ -200,6 +208,19 @@ int main(void)
 					rtc_has_time = true;
 				}
 			}
+		}
+
+		if (!web_log_window_closed &&
+		    boot_time_seconds >= WEB_LOG_WINDOW_SECONDS) {
+			LOG_INF("Web log window elapsed, shutting down HTTP + WiFi");
+			http_log_server_stop();
+			wifi_set_keep_connected(false);
+			wifi_disconnect();
+			gui_set_wifi_active(&gui, false);
+			/* Suppress the resync that would otherwise fire at this
+			 * exact second — next one at +WIFI_RESYNC_INTERVAL. */
+			last_wifi_resync = boot_time_seconds;
+			web_log_window_closed = true;
 		}
 
 		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
