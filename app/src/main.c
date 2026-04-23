@@ -178,8 +178,8 @@ int main(void)
 	wifi_module_init();
 	wifi_set_keep_connected(true);
 	http_log_server_start();
-	gui_set_wifi_active(&gui, true);
 	wifi_sync_start();
+	gui_set_wifi_active(&gui, wifi_is_active());
 
 	bool web_log_window_closed = false;
 
@@ -203,7 +203,6 @@ int main(void)
 
 		if (wifi_sync_in_progress()) {
 			if (wifi_sync_tick()) {
-				gui_set_wifi_active(&gui, false);
 				if (wifi_rtc_updated()) {
 					rtc_has_time = true;
 				}
@@ -229,10 +228,10 @@ int main(void)
 		    (boot_time_seconds % WIFI_RESYNC_INTERVAL) == 0 &&
 		    boot_time_seconds != last_wifi_resync) {
 			last_wifi_resync = boot_time_seconds;
-			gui_set_wifi_active(&gui, true);
 			wifi_sync_start();
 		}
 
+		gui_set_wifi_active(&gui, wifi_is_active());
 		lv_timer_handler();
 		k_sleep(K_SECONDS(1));
 		boot_time_seconds++;

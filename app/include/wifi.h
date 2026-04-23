@@ -10,6 +10,7 @@ bool wifi_sync_tick(void);
 bool wifi_sync_in_progress(void);
 bool wifi_sync_done(void);
 bool wifi_rtc_updated(void);
+bool wifi_is_active(void);
 
 /**
  * When true, NTP success does NOT auto-disconnect WiFi. Used while the

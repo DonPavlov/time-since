@@ -12,11 +12,14 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/ethernet_mgmt.h>
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/sntp.h>
 #include <zephyr/net/wifi_mgmt.h>
+
+#include <esp_mac.h>
 
 #include "time_utils.h"
 
@@ -42,6 +45,55 @@ enum sync_state {
 static volatile enum sync_state sync_state = SYNC_IDLE;
 static uint32_t sync_timer;
 static int ntp_attempts;
+
+static void log_iface_mac(struct net_if *iface, const char *prefix)
+{
+	const struct net_linkaddr *link_addr;
+
+	if (iface == NULL) {
+		return;
+	}
+
+	link_addr = net_if_get_link_addr(iface);
+	if (link_addr == NULL || link_addr->len < WIFI_MAC_ADDR_LEN) {
+		return;
+	}
+
+	LOG_INF("%s%02x:%02x:%02x:%02x:%02x:%02x",
+		prefix,
+		link_addr->addr[0], link_addr->addr[1], link_addr->addr[2],
+		link_addr->addr[3], link_addr->addr[4], link_addr->addr[5]);
+}
+
+static void wifi_apply_stable_mac(void)
+{
+	struct net_if *iface = net_if_get_default();
+	struct ethernet_req_params params = { 0 };
+	uint8_t factory_mac[WIFI_MAC_ADDR_LEN];
+	int ret;
+
+	if (iface == NULL) {
+		LOG_WRN("No default network interface, skipping MAC setup");
+		return;
+	}
+
+	ret = esp_efuse_mac_get_default(factory_mac);
+	if (ret != ESP_OK) {
+		LOG_ERR("Failed to read factory MAC: %d", ret);
+		return;
+	}
+
+	memcpy(params.mac_address.addr, factory_mac, sizeof(factory_mac));
+
+	ret = net_mgmt(NET_REQUEST_ETHERNET_SET_MAC_ADDRESS, iface, &params,
+		       sizeof(params));
+	if (ret != 0) {
+		LOG_ERR("Failed to apply stable WiFi MAC: %d", ret);
+		return;
+	}
+
+	log_iface_mac(iface, "Using WiFi STA MAC: ");
+}
 
 static void wifi_connect_handler(struct net_mgmt_event_callback *cb,
 				 uint64_t mgmt_event, struct net_if *iface)
@@ -71,6 +123,7 @@ static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
 		if (addr) {
 			net_addr_ntop(AF_INET, addr, buf, sizeof(buf));
 			LOG_INF("IP address obtained: %s", buf);
+			log_iface_mac(iface, "Router should show MAC: ");
 			LOG_INF("Logs: http://%s/ (hostname: time-since-box)", buf);
 		} else {
 			LOG_INF("IP address assigned");
@@ -187,6 +240,8 @@ static int try_ntp_sync(void)
 
 void wifi_module_init(void)
 {
+	wifi_apply_stable_mac();
+
 	net_mgmt_init_event_callback(&wifi_cb, wifi_connect_handler,
 				     NET_EVENT_WIFI_CONNECT_RESULT |
 				     NET_EVENT_WIFI_DISCONNECT_RESULT);
@@ -277,6 +332,12 @@ bool wifi_sync_done(void)
 bool wifi_rtc_updated(void)
 {
 	return rtc_updated;
+}
+
+bool wifi_is_active(void)
+{
+	return keep_connected || wifi_connected ||
+	       (sync_state != SYNC_IDLE && sync_state != SYNC_DONE);
 }
 
 void wifi_set_keep_connected(bool keep)
