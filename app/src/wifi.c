@@ -11,6 +11,7 @@
 
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/rtc.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/ethernet_mgmt.h>
 #include <zephyr/net/net_event.h>
@@ -18,6 +19,8 @@
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/sntp.h>
 #include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/sys/mem_stats.h>
+#include <zephyr/sys/sys_heap.h>
 
 #include <esp_mac.h>
 
@@ -26,6 +29,7 @@
 LOG_MODULE_REGISTER(wifi, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
+extern struct k_heap _system_heap;
 
 static volatile bool wifi_connected;
 static volatile bool rtc_updated;
@@ -45,6 +49,32 @@ enum sync_state {
 static volatile enum sync_state sync_state = SYNC_IDLE;
 static uint32_t sync_timer;
 static int ntp_attempts;
+
+static void log_system_heap(const char *stage)
+{
+	struct sys_memory_stats stats;
+	int ret = sys_heap_runtime_stats_get(&_system_heap.heap, &stats);
+
+	if (ret != 0) {
+		LOG_WRN("Failed to read heap stats at %s: %d", stage, ret);
+		return;
+	}
+
+	LOG_INF("Heap %s: free=%u alloc=%u max=%u",
+		stage,
+		(unsigned int)stats.free_bytes,
+		(unsigned int)stats.allocated_bytes,
+		(unsigned int)stats.max_allocated_bytes);
+}
+
+static void reset_system_heap_peak(void)
+{
+	int ret = sys_heap_runtime_stats_reset_max(&_system_heap.heap);
+
+	if (ret != 0) {
+		LOG_WRN("Failed to reset heap peak: %d", ret);
+	}
+}
 
 static void log_iface_mac(struct net_if *iface, const char *prefix)
 {
@@ -125,6 +155,7 @@ static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
 			LOG_INF("IP address obtained: %s", buf);
 			log_iface_mac(iface, "Router should show MAC: ");
 			LOG_INF("Logs: http://%s/ (hostname: time-since-box)", buf);
+			log_system_heap("after dhcp");
 		} else {
 			LOG_INF("IP address assigned");
 		}
@@ -160,6 +191,7 @@ static void start_wifi_connect(void)
 	}
 
 	LOG_INF("Attempting to connect to WiFi: %s", net->ssid);
+	log_system_heap("before wifi connect");
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params,
 			   sizeof(struct wifi_connect_req_params));
 	if (ret != 0) {
@@ -177,9 +209,11 @@ static int try_ntp_sync(void)
 	int ret;
 
 	LOG_INF("Trying NTP sync...");
+	log_system_heap("before ntp");
 	ret = sntp_simple("time.cloudflare.com", 2000, &sntp_time);
 	if (ret < 0) {
 		LOG_WRN("NTP failed: %d", ret);
+		log_system_heap("after ntp fail");
 		return ret;
 	}
 
@@ -231,6 +265,7 @@ static int try_ntp_sync(void)
 				}
 			}
 			rtc_updated = true;
+			log_system_heap("after ntp success");
 			return 0;
 		}
 	}
@@ -259,6 +294,8 @@ void wifi_sync_start(void)
 	ntp_attempts = 0;
 	rtc_updated = false;
 	wifi_network_idx = 0;
+	reset_system_heap_peak();
+	log_system_heap("sync start");
 	start_wifi_connect();
 }
 

@@ -18,20 +18,30 @@
 #include <zephyr/logging/log.h>
 
 #include "gui.h"
-#include "http_log_server.h"
 #include "power.h"
 #include "time_utils.h"
 #include "wifi.h"
+
+#ifdef CONFIG_APP_WEB_DEBUG
+#include "http_log_server.h"
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 
 static const uint32_t WIFI_RESYNC_INTERVAL = 300;
-/* Keep device awake long enough to cover the 5-minute web-log window, then
- * a bit more so the log viewer is still responsive right up to the cutoff. */
+#ifdef CONFIG_APP_WEB_DEBUG
+/* Debug: keep device awake long enough to cover the 5-minute web-log window,
+ * plus a bit more so the log viewer stays responsive right up to the cutoff. */
 static const uint32_t AUTO_SLEEP_SECONDS = 360;
 static const uint32_t WEB_LOG_WINDOW_SECONDS = 300;
+#else
+/* Release: just enough time to show elapsed counter, let NTP sync, and let
+ * the user press the button if needed. WiFi disconnects as soon as NTP
+ * succeeds (keep_connected stays false), then we auto-sleep shortly after. */
+static const uint32_t AUTO_SLEEP_SECONDS = 30;
+#endif
 
 /* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
 static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -176,12 +186,16 @@ int main(void)
 	power_init();
 
 	wifi_module_init();
+#ifdef CONFIG_APP_WEB_DEBUG
 	wifi_set_keep_connected(true);
 	http_log_server_start();
+#endif
 	wifi_sync_start();
 	gui_set_wifi_active(&gui, wifi_is_active());
 
+#ifdef CONFIG_APP_WEB_DEBUG
 	bool web_log_window_closed = false;
+#endif
 
 	while (1) {
 		bool usb_present = power_usb_present();
@@ -209,6 +223,7 @@ int main(void)
 			}
 		}
 
+#ifdef CONFIG_APP_WEB_DEBUG
 		if (!web_log_window_closed &&
 		    boot_time_seconds >= WEB_LOG_WINDOW_SECONDS) {
 			LOG_INF("Web log window elapsed, shutting down HTTP + WiFi");
@@ -221,6 +236,7 @@ int main(void)
 			last_wifi_resync = boot_time_seconds;
 			web_log_window_closed = true;
 		}
+#endif
 
 		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
 
