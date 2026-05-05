@@ -2,21 +2,23 @@
 #define WIFI_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 void wifi_module_init(void);
 
-void wifi_sync_start(void);
-bool wifi_sync_tick(void);
-bool wifi_sync_in_progress(void);
-bool wifi_sync_done(void);
-bool wifi_rtc_updated(void);
-bool wifi_is_active(void);
+/**
+ * Try each entry in known_networks[] once, with the given per-network
+ * connect timeout. Returns 0 on success, -ETIMEDOUT if all networks fail.
+ */
+int wifi_connect_any(uint32_t per_network_timeout_ms);
 
 /**
- * When true, NTP success does NOT auto-disconnect WiFi. Used while the
- * web log server is running so clients can reach it. Default: false.
+ * Try sntp_simple up to max_attempts times against time.cloudflare.com,
+ * 3s timeout per attempt. On success, writes RTC. Returns 0 on success.
  */
-void wifi_set_keep_connected(bool keep);
+int wifi_sync_ntp(int max_attempts);
+
+bool wifi_is_connected(void);
 
 void wifi_disconnect(void);
 

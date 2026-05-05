@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <time.h>
 
 #include <lvgl.h>
@@ -16,42 +15,28 @@
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 
 #include "gui.h"
+#include "http_log_server.h"
 #include "power.h"
 #include "time_utils.h"
 #include "wifi.h"
 
-#ifdef CONFIG_APP_WEB_DEBUG
-#include "http_log_server.h"
-#endif
-
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
-
-static const uint32_t WIFI_RESYNC_INTERVAL = 300;
-#ifdef CONFIG_APP_WEB_DEBUG
-/* Debug: keep device awake long enough to cover the 5-minute web-log window,
- * plus a bit more so the log viewer stays responsive right up to the cutoff. */
-static const uint32_t AUTO_SLEEP_SECONDS = 360;
-static const uint32_t WEB_LOG_WINDOW_SECONDS = 300;
-#else
-/* Release: just enough time to show elapsed counter, let NTP sync, and let
- * the user press the button if needed. WiFi disconnects as soon as NTP
- * succeeds (keep_connected stays false), then we auto-sleep shortly after. */
-static const uint32_t AUTO_SLEEP_SECONDS = 30;
-#endif
-
-/* Sleep button on GPIO0 (D0/A0 on XIAO ESP32-C6) */
 static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+
+static const uint32_t AUTO_SLEEP_SECONDS = 180;
+static const uint32_t WIFI_PER_NET_TIMEOUT_MS = 8000;
+static const int NTP_MAX_ATTEMPTS = 3;
+
 static struct gpio_callback sleep_btn_cb_data;
 static volatile bool sleep_requested;
-static bool sleep_btn_armed;
-static bool sleep_btn_ready;
 
-static uint32_t boot_time_seconds;
-static uint32_t last_wifi_resync;
+static time_t base_epoch;
+static int64_t base_uptime_ms;
 
 static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
 			      uint32_t pins)
@@ -59,98 +44,52 @@ static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb
 	sleep_requested = true;
 }
 
-static void arm_sleep_button_if_released(void)
+static void capture_base(time_t epoch)
 {
-	if (!sleep_btn_ready || sleep_btn_armed) {
-		return;
+	base_epoch = epoch;
+	base_uptime_ms = k_uptime_get();
+}
+
+static bool read_rtc_epoch(time_t *out)
+{
+	struct rtc_time rt = { 0 };
+
+	if (!device_is_ready(rtc) || rtc_get_time(rtc, &rt) != 0) {
+		return false;
 	}
 
-	int pin_val = gpio_pin_get_dt(&sleep_btn);
-	if (pin_val < 0) {
-		return;
+	*out = time_utils_rtc_to_epoch_utc(&rt);
+	return true;
+}
+
+static uint32_t elapsed_seconds(void)
+{
+	time_t start = time_utils_start_epoch_utc();
+
+	if (base_epoch == 0 || base_epoch <= start) {
+		return 0;
 	}
 
-	if (pin_val != 0) {
-		k_sleep(K_MSEC(50));
-		if (gpio_pin_get_dt(&sleep_btn) != 0) {
-			gpio_pin_interrupt_configure_dt(&sleep_btn,
-							GPIO_INT_EDGE_TO_ACTIVE);
-			sleep_btn_armed = true;
-		}
-	}
+	int64_t delta_ms = k_uptime_get() - base_uptime_ms;
+	return (uint32_t)((base_epoch - start) + delta_ms / 1000);
 }
 
 static void enter_sleep(const struct device *display)
 {
-	LOG_INF("Entering sleep...");
-
-	display_blanking_on(display);
+	LOG_INF("Sleep");
 	wifi_disconnect();
-
-	if (!sleep_btn_ready) {
-		return;
-	}
-
-	if (sleep_btn_armed) {
-		gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_DISABLE);
-	}
-
-	while (!gpio_pin_get_dt(&sleep_btn)) {
-		k_sleep(K_MSEC(50));
-	}
-
-	k_sleep(K_MSEC(80));
+	display_blanking_on(display);
+	(void)pm_device_action_run(display, PM_DEVICE_ACTION_SUSPEND);
+	k_sleep(K_MSEC(50));
 	(void)power_enter_deep_sleep(&sleep_btn);
-}
-
-static bool rtc_has_valid_time(void)
-{
-	if (!device_is_ready(rtc)) {
-		return false;
-	}
-
-	struct rtc_time rtc_check = { 0 };
-	time_t now_epoch;
-	time_t start_epoch = time_utils_start_epoch_utc();
-
-	if (rtc_get_time(rtc, &rtc_check) != 0) {
-		return false;
-	}
-
-	now_epoch = time_utils_rtc_to_epoch_utc(&rtc_check);
-	if (now_epoch <= start_epoch) {
-		return false;
-	}
-
-	LOG_INF("RTC has valid time: %02d:%02d:%02d",
-		rtc_check.tm_hour, rtc_check.tm_min, rtc_check.tm_sec);
-	return true;
-}
-
-static uint32_t calculate_elapsed_seconds(bool use_rtc)
-{
-	struct rtc_time now = { 0 };
-	time_t now_epoch;
-	time_t start_epoch = time_utils_start_epoch_utc();
-
-	if (use_rtc && device_is_ready(rtc) && rtc_get_time(rtc, &now) == 0) {
-		now_epoch = time_utils_rtc_to_epoch_utc(&now);
-
-		if (now_epoch > start_epoch) {
-			return (uint32_t)(now_epoch - start_epoch);
-		}
-		return 0;
-	}
-
-	return boot_time_seconds;
 }
 
 int main(void)
 {
 	const struct device *display;
 	struct gui_ctx gui;
+	time_t epoch;
 	bool rtc_has_time = false;
-	int ret;
 
 	LOG_INF("main() started");
 
@@ -160,96 +99,56 @@ int main(void)
 		return 0;
 	}
 
-	rtc_has_time = rtc_has_valid_time();
+	if (read_rtc_epoch(&epoch) && epoch > time_utils_start_epoch_utc()) {
+		capture_base(epoch);
+		rtc_has_time = true;
+		LOG_INF("RTC valid, base epoch=%lld", (long long)epoch);
+	}
 
-	gui_init(&gui, rtc_has_time,
-		 calculate_elapsed_seconds(rtc_has_time));
+	gui_init(&gui, rtc_has_time, elapsed_seconds());
 	lv_timer_handler();
 
-	ret = display_blanking_off(display);
+	int ret = display_blanking_off(display);
 	if (ret < 0 && ret != -ENOSYS) {
 		LOG_ERR("display blanking off failed (%d)", ret);
 		return 0;
 	}
 
-	if (!gpio_is_ready_dt(&sleep_btn)) {
-		LOG_ERR("Sleep button GPIO not ready");
-	} else {
+	if (gpio_is_ready_dt(&sleep_btn)) {
 		gpio_pin_configure_dt(&sleep_btn, GPIO_INPUT);
 		gpio_init_callback(&sleep_btn_cb_data, sleep_btn_pressed,
 				   BIT(sleep_btn.pin));
 		gpio_add_callback(sleep_btn.port, &sleep_btn_cb_data);
-		sleep_btn_armed = false;
-		sleep_btn_ready = true;
+		gpio_pin_interrupt_configure_dt(&sleep_btn, GPIO_INT_EDGE_TO_ACTIVE);
+	} else {
+		LOG_ERR("Sleep button GPIO not ready");
 	}
 
-	power_init();
-
 	wifi_module_init();
-#ifdef CONFIG_APP_WEB_DEBUG
-	wifi_set_keep_connected(true);
-	http_log_server_start();
-#endif
-	wifi_sync_start();
-	gui_set_wifi_active(&gui, wifi_is_active());
 
-#ifdef CONFIG_APP_WEB_DEBUG
-	bool web_log_window_closed = false;
-#endif
+	if (wifi_connect_any(WIFI_PER_NET_TIMEOUT_MS) == 0) {
+		gui_set_wifi_active(&gui, true);
+		(void)http_log_server_start();
 
-	while (1) {
-		bool usb_present = power_usb_present();
-
-		arm_sleep_button_if_released();
-
-		if (sleep_requested) {
-			if (usb_present) {
-				sleep_requested = false;
-			} else {
-				k_sleep(K_MSEC(50));
-				enter_sleep(display);
+		if (wifi_sync_ntp(NTP_MAX_ATTEMPTS) == 0) {
+			if (read_rtc_epoch(&epoch)) {
+				capture_base(epoch);
+				rtc_has_time = true;
+				gui_set_counter(&gui, elapsed_seconds());
 			}
 		}
+	}
 
-		if (!usb_present && boot_time_seconds >= AUTO_SLEEP_SECONDS) {
+	uint32_t boot_seconds = 0;
+	while (1) {
+		if (sleep_requested || boot_seconds >= AUTO_SLEEP_SECONDS) {
 			enter_sleep(display);
 		}
 
-		if (wifi_sync_in_progress()) {
-			if (wifi_sync_tick()) {
-				if (wifi_rtc_updated()) {
-					rtc_has_time = true;
-				}
-			}
-		}
-
-#ifdef CONFIG_APP_WEB_DEBUG
-		if (!web_log_window_closed &&
-		    boot_time_seconds >= WEB_LOG_WINDOW_SECONDS) {
-			LOG_INF("Web log window elapsed, shutting down HTTP + WiFi");
-			http_log_server_stop();
-			wifi_set_keep_connected(false);
-			wifi_disconnect();
-			gui_set_wifi_active(&gui, false);
-			/* Suppress the resync that would otherwise fire at this
-			 * exact second — next one at +WIFI_RESYNC_INTERVAL. */
-			last_wifi_resync = boot_time_seconds;
-			web_log_window_closed = true;
-		}
-#endif
-
-		gui_set_counter(&gui, calculate_elapsed_seconds(rtc_has_time));
-
-		if (wifi_sync_done() &&
-		    (boot_time_seconds % WIFI_RESYNC_INTERVAL) == 0 &&
-		    boot_time_seconds != last_wifi_resync) {
-			last_wifi_resync = boot_time_seconds;
-			wifi_sync_start();
-		}
-
-		gui_set_wifi_active(&gui, wifi_is_active());
+		gui_set_counter(&gui, rtc_has_time ? elapsed_seconds() : boot_seconds);
+		gui_set_wifi_active(&gui, wifi_is_connected());
 		lv_timer_handler();
 		k_sleep(K_SECONDS(1));
-		boot_time_seconds++;
+		boot_seconds++;
 	}
 }

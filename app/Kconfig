@@ -13,12 +13,3 @@ endmenu
 module = APP
 module-str = APP
 source "subsys/logging/Kconfig.template.log_config"
-
-config APP_WEB_DEBUG
-	bool "Enable HTTP log viewer + keep WiFi connected longer for debug"
-	default n
-	help
-	  When enabled, the in-RAM log backend is exposed over HTTP on :80
-	  and WiFi stays up for WEB_LOG_WINDOW_SECONDS after boot. When
-	  disabled (release build), WiFi only stays up long enough to sync
-	  NTP, then disconnects; device auto-sleeps soon after.
