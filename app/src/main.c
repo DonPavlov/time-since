@@ -18,7 +18,6 @@
 #include <zephyr/pm/device.h>
 
 #include "gui.h"
-#include "http_log_server.h"
 #include "power.h"
 #include "time_utils.h"
 #include "wifi.h"
@@ -31,10 +30,15 @@ static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpi
 static const uint32_t AUTO_SLEEP_SECONDS = 180;
 static const uint32_t WIFI_PER_NET_TIMEOUT_MS = 8000;
 static const int NTP_MAX_ATTEMPTS = 3;
+static const uint32_t NTP_RETRY_DELAY_SECONDS = 5;
+static const uint32_t WIFI_SYNC_ICON_MIN_SECONDS = 3;
+static const int64_t WIFI_SYNC_ICON_BLINK_MS = 300;
+static const int64_t GUI_TICK_MS = 100;
 
 static struct gpio_callback sleep_btn_cb_data;
 static volatile bool sleep_requested;
 static volatile bool time_sync_active;
+static volatile bool time_sync_blink;
 
 static time_t base_epoch;
 static int64_t base_uptime_ms;
@@ -115,10 +119,30 @@ static uint32_t elapsed_seconds(void)
 	return (uint32_t)(epoch - start);
 }
 
+static void ntp_retry_started(int ret, void *user_data)
+{
+	ARG_UNUSED(ret);
+	ARG_UNUSED(user_data);
+
+	time_sync_blink = true;
+}
+
+static bool wifi_icon_active(int64_t sync_icon_min_until_ms)
+{
+	bool active = wifi_is_connected() || k_uptime_get() < sync_icon_min_until_ms;
+
+	if (active && time_sync_blink) {
+		return ((k_uptime_get() / WIFI_SYNC_ICON_BLINK_MS) % 2) == 0;
+	}
+
+	return active;
+}
+
 static void time_sync_thread(void *arg1, void *arg2, void *arg3)
 {
 	time_t before_sync;
 	time_t synced_epoch;
+	int ret;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -128,29 +152,32 @@ static void time_sync_thread(void *arg1, void *arg2, void *arg3)
 
 	if (wifi_connect_any(WIFI_PER_NET_TIMEOUT_MS) != 0) {
 		time_sync_active = false;
+		time_sync_blink = false;
 		return;
 	}
 
-	(void)http_log_server_start();
-
 	before_sync = current_epoch();
-	if (wifi_sync_ntp(NTP_MAX_ATTEMPTS) != 0) {
-		time_sync_active = false;
-		return;
+	ret = wifi_sync_ntp(NTP_MAX_ATTEMPTS, NTP_RETRY_DELAY_SECONDS,
+			    ntp_retry_started, NULL);
+	if (ret != 0) {
+		goto out;
 	}
 
 	if (!read_rtc_epoch(&synced_epoch)) {
-		time_sync_active = false;
-		return;
+		goto out;
 	}
 
 	capture_base(synced_epoch);
-	time_sync_active = false;
 
 	if (before_sync != 0) {
 		LOG_INF("NTP adjusted elapsed base by %lld seconds",
 			(long long)(synced_epoch - before_sync));
 	}
+
+out:
+	wifi_disconnect();
+	time_sync_blink = false;
+	time_sync_active = false;
 }
 
 static void enter_sleep(const struct device *display)
@@ -168,6 +195,8 @@ int main(void)
 	const struct device *display;
 	struct gui_ctx gui;
 	time_t epoch;
+	int64_t boot_uptime_ms;
+	int64_t wifi_sync_icon_min_until_ms;
 	bool rtc_has_time = false;
 
 	LOG_INF("main() started");
@@ -205,8 +234,10 @@ int main(void)
 
 	wifi_module_init();
 	time_sync_active = true;
-	gui_set_wifi_active(&gui, true);
-	lv_timer_handler();
+	time_sync_blink = false;
+	boot_uptime_ms = k_uptime_get();
+	wifi_sync_icon_min_until_ms = boot_uptime_ms +
+				      WIFI_SYNC_ICON_MIN_SECONDS * MSEC_PER_SEC;
 
 	k_thread_create(&time_sync_thread_data, time_sync_stack,
 			K_THREAD_STACK_SIZEOF(time_sync_stack),
@@ -214,17 +245,19 @@ int main(void)
 			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
 	k_thread_name_set(&time_sync_thread_data, "time_sync");
 
-	uint32_t boot_seconds = 0;
 	while (1) {
+		uint32_t boot_seconds =
+			(uint32_t)((k_uptime_get() - boot_uptime_ms) / MSEC_PER_SEC);
+
 		if (sleep_requested || boot_seconds >= AUTO_SLEEP_SECONDS) {
 			enter_sleep(display);
 		}
 
 		gui_set_counter(&gui,
 				time_base_ready() ? elapsed_seconds() : boot_seconds);
-		gui_set_wifi_active(&gui, time_sync_active || wifi_is_connected());
+		gui_set_wifi_active(&gui,
+				    wifi_icon_active(wifi_sync_icon_min_until_ms));
 		lv_timer_handler();
-		k_sleep(K_SECONDS(1));
-		boot_seconds++;
+		k_sleep(K_MSEC(GUI_TICK_MS));
 	}
 }

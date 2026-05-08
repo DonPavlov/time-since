@@ -201,7 +201,8 @@ int wifi_connect_any(uint32_t per_network_timeout_ms)
 	return -ETIMEDOUT;
 }
 
-int wifi_sync_ntp(int max_attempts)
+int wifi_sync_ntp(int max_attempts, uint32_t retry_delay_seconds,
+		  wifi_ntp_retry_cb_t retry_cb, void *user_data)
 {
 	struct sntp_time sntp_time;
 	struct tm *utc;
@@ -216,6 +217,12 @@ int wifi_sync_ntp(int max_attempts)
 			break;
 		}
 		LOG_WRN("NTP failed: %d", ret);
+		if (attempt + 1 < max_attempts) {
+			if (retry_cb != NULL) {
+				retry_cb(ret, user_data);
+			}
+			k_sleep(K_SECONDS(retry_delay_seconds));
+		}
 	}
 
 	if (ret != 0) {
