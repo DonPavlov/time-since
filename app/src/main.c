@@ -34,9 +34,13 @@ static const int NTP_MAX_ATTEMPTS = 3;
 
 static struct gpio_callback sleep_btn_cb_data;
 static volatile bool sleep_requested;
+static volatile bool time_sync_active;
 
 static time_t base_epoch;
 static int64_t base_uptime_ms;
+static K_MUTEX_DEFINE(time_base_lock);
+static K_THREAD_STACK_DEFINE(time_sync_stack, 4096);
+static struct k_thread time_sync_thread_data;
 
 static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
 			      uint32_t pins)
@@ -46,8 +50,45 @@ static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb
 
 static void capture_base(time_t epoch)
 {
+	k_mutex_lock(&time_base_lock, K_FOREVER);
 	base_epoch = epoch;
 	base_uptime_ms = k_uptime_get();
+	k_mutex_unlock(&time_base_lock);
+}
+
+static time_t base_epoch_snapshot(void)
+{
+	time_t epoch;
+
+	k_mutex_lock(&time_base_lock, K_FOREVER);
+	epoch = base_epoch;
+	k_mutex_unlock(&time_base_lock);
+
+	return epoch;
+}
+
+static bool time_base_ready(void)
+{
+	return base_epoch_snapshot() > time_utils_start_epoch_utc();
+}
+
+static time_t current_epoch(void)
+{
+	time_t epoch;
+	int64_t uptime_ms;
+	int64_t delta_ms;
+
+	k_mutex_lock(&time_base_lock, K_FOREVER);
+	epoch = base_epoch;
+	uptime_ms = base_uptime_ms;
+	k_mutex_unlock(&time_base_lock);
+
+	if (epoch == 0) {
+		return 0;
+	}
+
+	delta_ms = k_uptime_get() - uptime_ms;
+	return epoch + delta_ms / 1000;
 }
 
 static bool read_rtc_epoch(time_t *out)
@@ -65,13 +106,51 @@ static bool read_rtc_epoch(time_t *out)
 static uint32_t elapsed_seconds(void)
 {
 	time_t start = time_utils_start_epoch_utc();
+	time_t epoch = current_epoch();
 
-	if (base_epoch == 0 || base_epoch <= start) {
+	if (epoch == 0 || epoch <= start) {
 		return 0;
 	}
 
-	int64_t delta_ms = k_uptime_get() - base_uptime_ms;
-	return (uint32_t)((base_epoch - start) + delta_ms / 1000);
+	return (uint32_t)(epoch - start);
+}
+
+static void time_sync_thread(void *arg1, void *arg2, void *arg3)
+{
+	time_t before_sync;
+	time_t synced_epoch;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	LOG_INF("Time sync thread started");
+
+	if (wifi_connect_any(WIFI_PER_NET_TIMEOUT_MS) != 0) {
+		time_sync_active = false;
+		return;
+	}
+
+	(void)http_log_server_start();
+
+	before_sync = current_epoch();
+	if (wifi_sync_ntp(NTP_MAX_ATTEMPTS) != 0) {
+		time_sync_active = false;
+		return;
+	}
+
+	if (!read_rtc_epoch(&synced_epoch)) {
+		time_sync_active = false;
+		return;
+	}
+
+	capture_base(synced_epoch);
+	time_sync_active = false;
+
+	if (before_sync != 0) {
+		LOG_INF("NTP adjusted elapsed base by %lld seconds",
+			(long long)(synced_epoch - before_sync));
+	}
 }
 
 static void enter_sleep(const struct device *display)
@@ -125,19 +204,15 @@ int main(void)
 	}
 
 	wifi_module_init();
+	time_sync_active = true;
+	gui_set_wifi_active(&gui, true);
+	lv_timer_handler();
 
-	if (wifi_connect_any(WIFI_PER_NET_TIMEOUT_MS) == 0) {
-		gui_set_wifi_active(&gui, true);
-		(void)http_log_server_start();
-
-		if (wifi_sync_ntp(NTP_MAX_ATTEMPTS) == 0) {
-			if (read_rtc_epoch(&epoch)) {
-				capture_base(epoch);
-				rtc_has_time = true;
-				gui_set_counter(&gui, elapsed_seconds());
-			}
-		}
-	}
+	k_thread_create(&time_sync_thread_data, time_sync_stack,
+			K_THREAD_STACK_SIZEOF(time_sync_stack),
+			time_sync_thread, NULL, NULL, NULL,
+			K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	k_thread_name_set(&time_sync_thread_data, "time_sync");
 
 	uint32_t boot_seconds = 0;
 	while (1) {
@@ -145,8 +220,9 @@ int main(void)
 			enter_sleep(display);
 		}
 
-		gui_set_counter(&gui, rtc_has_time ? elapsed_seconds() : boot_seconds);
-		gui_set_wifi_active(&gui, wifi_is_connected());
+		gui_set_counter(&gui,
+				time_base_ready() ? elapsed_seconds() : boot_seconds);
+		gui_set_wifi_active(&gui, time_sync_active || wifi_is_connected());
 		lv_timer_handler();
 		k_sleep(K_SECONDS(1));
 		boot_seconds++;

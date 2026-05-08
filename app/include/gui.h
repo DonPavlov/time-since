@@ -15,8 +15,9 @@ struct gui_ctx {
 	lv_obj_t *wifi_label;
 	lv_style_t counter_label_style;
 	lv_style_t wifi_label_style;
-	char counter_buf[32];
+	char counter_buf[64];
 	uint32_t last_elapsed;
+	bool last_wifi_active;
 };
 
 void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed);
