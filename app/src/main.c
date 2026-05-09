@@ -60,22 +60,6 @@ static void capture_base(time_t epoch)
 	k_mutex_unlock(&time_base_lock);
 }
 
-static time_t base_epoch_snapshot(void)
-{
-	time_t epoch;
-
-	k_mutex_lock(&time_base_lock, K_FOREVER);
-	epoch = base_epoch;
-	k_mutex_unlock(&time_base_lock);
-
-	return epoch;
-}
-
-static bool time_base_ready(void)
-{
-	return base_epoch_snapshot() > time_utils_start_epoch_utc();
-}
-
 static time_t current_epoch(void)
 {
 	time_t epoch;
@@ -253,8 +237,7 @@ int main(void)
 			enter_sleep(display);
 		}
 
-		gui_set_counter(&gui,
-				time_base_ready() ? elapsed_seconds() : boot_seconds);
+		gui_set_counter(&gui, elapsed_seconds());
 		gui_set_wifi_active(&gui,
 				    wifi_icon_active(wifi_sync_icon_min_until_ms));
 		lv_timer_handler();

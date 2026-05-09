@@ -4,9 +4,9 @@
 
 #include "gui.h"
 
-#include <stdio.h>
-
 #include <zephyr/logging/log.h>
+
+#include "time_utils.h"
 
 LOG_MODULE_REGISTER(gui, LOG_LEVEL_DBG);
 
@@ -49,14 +49,9 @@ void gui_set_counter(struct gui_ctx *ctx, uint32_t elapsed)
 		return;
 	}
 
-	uint32_t days = elapsed / 86400U;
-	uint32_t hours = (elapsed / 3600U) % 24U;
-	uint32_t minutes = (elapsed / 60U) % 60U;
-	uint32_t seconds = elapsed % 60U;
-
 	ctx->last_elapsed = elapsed;
-	snprintf(ctx->counter_buf, sizeof(ctx->counter_buf),
-		 "%06u\n%02u %02u %02u", days, hours, minutes, seconds);
+	time_utils_format_elapsed(elapsed, ctx->counter_buf,
+				  sizeof(ctx->counter_buf));
 	lv_label_set_text(ctx->counter_label, ctx->counter_buf);
 }
 

@@ -4,7 +4,7 @@
 #include <zephyr/drivers/rtc.h>
 
 /**
- * @brief Start date/time configuration (treated as UTC)
+ * @brief Start date/time configuration (treated as Berlin local time)
  *
  * Fields:
  * - tm_year: year since 1900 (2025 -> 125)

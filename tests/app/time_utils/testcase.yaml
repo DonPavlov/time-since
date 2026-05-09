@@ -1,0 +1,6 @@
+common:
+  tags: app time
+  integration_platforms:
+    - native_sim
+tests:
+  app.time_utils: {}
