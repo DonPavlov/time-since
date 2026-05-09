@@ -72,7 +72,7 @@ ZTEST(time_utils, test_elapsed_format_zero)
 
 	time_utils_format_elapsed(0, buf, sizeof(buf));
 
-	zassert_true(strcmp(buf, "000000\n00:00:00") == 0,
+	zassert_true(strcmp(buf, "000000\n00 00 00") == 0,
 		     "unexpected elapsed string: %s", buf);
 }
 
@@ -82,7 +82,7 @@ ZTEST(time_utils, test_elapsed_format_minutes_since_same_local_time)
 
 	time_utils_format_elapsed(17U * 60U + 42U, buf, sizeof(buf));
 
-	zassert_true(strcmp(buf, "000000\n00:17:42") == 0,
+	zassert_true(strcmp(buf, "000000\n00 17 42") == 0,
 		     "unexpected elapsed string: %s", buf);
 }
 
@@ -93,7 +93,7 @@ ZTEST(time_utils, test_elapsed_format_day_plus_remainder)
 
 	time_utils_format_elapsed(elapsed, buf, sizeof(buf));
 
-	zassert_true(strcmp(buf, "000001\n22:45:00") == 0,
+	zassert_true(strcmp(buf, "000001\n22 45 00") == 0,
 		     "unexpected elapsed string: %s", buf);
 }
 
