@@ -19,7 +19,7 @@ LOG_MODULE_REGISTER(power, LOG_LEVEL_DBG);
 int power_enter_deep_sleep(const struct gpio_dt_spec *wake_button)
 {
 	esp_err_t err;
-	esp_deepsleep_gpio_wake_up_mode_t wake_mode;
+	esp_sleep_gpio_wake_up_mode_t wake_mode;
 
 	if (wake_button == NULL) {
 		return -EINVAL;
@@ -28,7 +28,8 @@ int power_enter_deep_sleep(const struct gpio_dt_spec *wake_button)
 	wake_mode = (wake_button->dt_flags & GPIO_ACTIVE_LOW) != 0 ?
 		ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
 
-	err = esp_deep_sleep_enable_gpio_wakeup(1ULL << wake_button->pin, wake_mode);
+	err = esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(
+		1ULL << wake_button->pin, wake_mode);
 	if (err != ESP_OK) {
 		LOG_ERR("Failed to configure wake GPIO%d: %d",
 			wake_button->pin, err);

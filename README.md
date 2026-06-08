@@ -47,45 +47,72 @@ app/
   boards/         devicetree overlay for the XIAO ESP32-C6
   prj.conf        Kconfig: display, RTC, WiFi, NTP, logging, power management
 tests/app/        ztest suites (time_utils: epoch/DST/format)
-drivers/ lib/     Zephyr module sample dirs (not core to the app)
-west.yml          west manifest (imports Zephyr)
+west.yml          west manifest — imports Zephyr + only the modules this app needs
 ```
 
-## 1. Initialize the Zephyr / west workspace
+This repo is the **west manifest repository**: `west.yml` pins Zephyr and the
+modules the app needs (`hal_espressif`, `lvgl`, `mbedtls`, `tf-psa-crypto`).
 
-You need Python 3, [`west`](https://docs.zephyrproject.org/latest/develop/west/),
-the Zephyr SDK, and the Espressif toolchain.
+## Prerequisites (Ubuntu/Debian)
+
+Install the host build tools (see the
+[Zephyr getting-started guide](https://docs.zephyrproject.org/latest/develop/getting_started/)
+for other OSes):
 
 ```shell
-# Install west (once)
-pip install west
-
-# Create the workspace with this repo as the manifest
-west init -m https://github.com/DonPavlov/time-since --mr main time-since-workspace
-cd time-since-workspace
-
-# Clone Zephyr + the modules listed in west.yml
-west update
-
-# Register Zephyr's CMake package
-west zephyr-export
-
-# Install Zephyr's Python dependencies (a venv is recommended)
-pip install -r zephyr/scripts/requirements.txt
+sudo apt install --no-install-recommends git cmake ninja-build gperf \
+  ccache dfu-util device-tree-compiler wget python3-dev python3-venv python3-tk \
+  xz-utils file make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
 ```
 
-> **ESP32 note:** this board needs the Espressif HAL. Make sure `hal_espressif`
-> is included in the manifest's module list in `west.yml`, run `west update`, then
-> fetch the required binary blobs:
-> ```shell
-> west blobs fetch hal_espressif
-> ```
+## 1. Create the workspace
 
-Install the Zephyr SDK separately if you have not already — see the
-[Zephyr getting-started guide](https://docs.zephyrproject.org/latest/develop/getting_started/).
-Subsequent commands assume the Zephyr Python virtualenv is active.
+The app lives **next to** Zephyr inside a west workspace. Clone this repo, then
+let west initialise the workspace around it:
 
-## 2. Configure
+```shell
+# Workspace folder (any name/location works)
+mkdir time-since-workspace && cd time-since-workspace
+
+# This repo = the west manifest
+git clone https://github.com/DonPavlov/time-since
+
+# Python virtualenv for west + Zephyr tooling (activate it every session)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install west
+
+# Initialise the workspace from the manifest, then pull Zephyr + modules
+west init -l time-since
+west update
+
+# Register Zephyr's CMake package and install its Python deps
+west zephyr-export
+west packages pip --install
+```
+
+After this the workspace looks like:
+
+```
+time-since-workspace/
+  .venv/        Python virtualenv
+  .west/        west config
+  zephyr/       Zephyr RTOS (cloned by west update)
+  modules/      hal_espressif, lvgl, mbedtls, tf-psa-crypto
+  time-since/   this app
+```
+
+## 2. Install the toolchain and ESP32 blobs
+
+```shell
+# Zephyr SDK (compilers — includes the riscv64 toolchain the ESP32-C6 uses)
+west sdk install
+
+# Espressif binary blobs (WiFi/PHY firmware) — required to link the WiFi stack
+west blobs fetch hal_espressif
+```
+
+## 3. Configure
 
 **WiFi credentials** — create `app/include/wifi_creds.h` (gitignored). It must
 define the `struct wifi_network` type, the `known_networks[]` array, and
@@ -119,20 +146,26 @@ static const struct rtc_time START_TIME = {
 };
 ```
 
-## 3. Build & flash
+## 4. Build & flash
+
+From inside the `time-since` directory (venv active):
 
 ```shell
-# From the workspace root (or the app/ directory)
+cd time-since
 west build -b xiao_esp32c6/esp32c6/hpcore app
 
 # Flash over USB
 west flash
 ```
 
-## 4. Run the tests
+Add `-p always` to `west build` for a pristine (clean) rebuild.
+
+## 5. Run the tests (no hardware needed)
+
+The unit tests build and run on the host simulator (`native_sim`):
 
 ```shell
-west twister -T tests --integration
+west twister -T tests -p native_sim
 ```
 
 The `time_utils` suite covers UTC epoch conversion, Berlin DST handling, and the
@@ -159,5 +192,8 @@ elapsed-time string formatting.
 - **Wrong elapsed time** — verify `start_time.h` (remember `tm_year` is since 1900
   and `tm_mon` is 0-indexed) and that the start instant is the intended Berlin
   local time.
-- **Build can't find ESP32 support** — ensure `hal_espressif` is in the west
-  manifest and blobs are fetched (see step 1).
+- **`undefined symbol LV_*` / `MBEDTLS` / `TF-PSA-Crypto` Kconfig or CMake errors**
+  — a required module is missing. Re-run `west update` so `west.yml`'s module list
+  (`hal_espressif`, `lvgl`, `mbedtls`, `tf-psa-crypto`) is fully cloned.
+- **Link error about `esp_..._gpio_wakeup`** — Espressif HAL API drift; the deep-
+  sleep wakeup call lives in `app/src/power.c`.
