@@ -98,6 +98,10 @@ static void wifi_event_handler(struct net_mgmt_event_callback *cb,
 	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
 		LOG_INF("WiFi disconnected");
 		wifi_connected = false;
+		/* Wake a pending connect wait so it fails fast instead of
+		 * blocking the full per-network timeout.
+		 */
+		k_sem_give(&wifi_connect_sem);
 	}
 }
 
@@ -110,7 +114,7 @@ static void ipv4_addr_handler(struct net_mgmt_event_callback *cb,
 									 NET_ADDR_PREFERRED);
 		if (addr) {
 			net_addr_ntop(AF_INET, addr, buf, sizeof(buf));
-			LOG_INF("IP: %s — http://%s/", buf, buf);
+			LOG_INF("IP: %s", buf);
 		}
 	}
 }

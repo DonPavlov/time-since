@@ -20,7 +20,7 @@ struct gui_ctx {
 	bool last_wifi_active;
 };
 
-void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed);
+void gui_init(struct gui_ctx *ctx, uint32_t initial_elapsed);
 void gui_set_counter(struct gui_ctx *ctx, uint32_t elapsed);
 void gui_set_wifi_active(struct gui_ctx *ctx, bool active);
 

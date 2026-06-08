@@ -10,7 +10,7 @@
 
 LOG_MODULE_REGISTER(gui, LOG_LEVEL_DBG);
 
-void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed)
+void gui_init(struct gui_ctx *ctx, uint32_t initial_elapsed)
 {
 	if (ctx == NULL) {
 		return;
@@ -37,7 +37,6 @@ void gui_init(struct gui_ctx *ctx, bool rtc_has_time, uint32_t initial_elapsed)
 	lv_obj_add_style(ctx->wifi_label, &ctx->wifi_label_style, 0);
 	lv_obj_align(ctx->wifi_label, LV_ALIGN_BOTTOM_RIGHT, -2, -3);
 
-	(void)rtc_has_time;
 	gui_set_counter(ctx, initial_elapsed);
 	gui_set_wifi_active(ctx, false);
 }

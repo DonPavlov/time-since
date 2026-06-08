@@ -28,6 +28,9 @@ static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc));
 static const struct gpio_dt_spec sleep_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
 static const uint32_t AUTO_SLEEP_SECONDS = 180;
+static const uint32_t BTN_WAKE_GRACE_SECONDS = 3;
+static const int64_t BTN_RELEASE_STABLE_MS = 50;
+static const int64_t BTN_RELEASE_POLL_MS = 10;
 static const uint32_t WIFI_PER_NET_TIMEOUT_MS = 8000;
 static const int NTP_MAX_ATTEMPTS = 3;
 static const uint32_t NTP_RETRY_DELAY_SECONDS = 5;
@@ -37,13 +40,12 @@ static const int64_t GUI_TICK_MS = 100;
 
 static struct gpio_callback sleep_btn_cb_data;
 static volatile bool sleep_requested;
-static volatile bool time_sync_active;
 static volatile bool time_sync_blink;
 
 static time_t base_epoch;
 static int64_t base_uptime_ms;
 static K_MUTEX_DEFINE(time_base_lock);
-static K_THREAD_STACK_DEFINE(time_sync_stack, 4096);
+static K_THREAD_STACK_DEFINE(time_sync_stack, 6144);
 static struct k_thread time_sync_thread_data;
 
 static void sleep_btn_pressed(const struct device *dev, struct gpio_callback *cb,
@@ -135,7 +137,6 @@ static void time_sync_thread(void *arg1, void *arg2, void *arg3)
 	LOG_INF("Time sync thread started");
 
 	if (wifi_connect_any(WIFI_PER_NET_TIMEOUT_MS) != 0) {
-		time_sync_active = false;
 		time_sync_blink = false;
 		return;
 	}
@@ -161,7 +162,36 @@ static void time_sync_thread(void *arg1, void *arg2, void *arg3)
 out:
 	wifi_disconnect();
 	time_sync_blink = false;
-	time_sync_active = false;
+}
+
+/*
+ * Block until the sleep button has been released (logical inactive) continuously
+ * for BTN_RELEASE_STABLE_MS. Deep-sleep wake is level-triggered on GPIO LOW, so
+ * arming it while the button is still held would wake the chip immediately. A
+ * no-op if the GPIO is not ready, so it can never hang.
+ */
+static void wait_button_released(void)
+{
+	int64_t released_since_ms = -1;
+
+	if (!gpio_is_ready_dt(&sleep_btn)) {
+		return;
+	}
+
+	while (true) {
+		if (gpio_pin_get_dt(&sleep_btn) == 0) {
+			if (released_since_ms < 0) {
+				released_since_ms = k_uptime_get();
+			} else if (k_uptime_get() - released_since_ms >=
+				   BTN_RELEASE_STABLE_MS) {
+				return;
+			}
+		} else {
+			released_since_ms = -1;
+		}
+
+		k_sleep(K_MSEC(BTN_RELEASE_POLL_MS));
+	}
 }
 
 static void enter_sleep(const struct device *display)
@@ -170,7 +200,7 @@ static void enter_sleep(const struct device *display)
 	wifi_disconnect();
 	display_blanking_on(display);
 	(void)pm_device_action_run(display, PM_DEVICE_ACTION_SUSPEND);
-	k_sleep(K_MSEC(50));
+	wait_button_released();
 	(void)power_enter_deep_sleep(&sleep_btn);
 }
 
@@ -181,7 +211,6 @@ int main(void)
 	time_t epoch;
 	int64_t boot_uptime_ms;
 	int64_t wifi_sync_icon_min_until_ms;
-	bool rtc_has_time = false;
 
 	LOG_INF("main() started");
 
@@ -193,11 +222,10 @@ int main(void)
 
 	if (read_rtc_epoch(&epoch) && epoch > time_utils_start_epoch_utc()) {
 		capture_base(epoch);
-		rtc_has_time = true;
 		LOG_INF("RTC valid, base epoch=%lld", (long long)epoch);
 	}
 
-	gui_init(&gui, rtc_has_time, elapsed_seconds());
+	gui_init(&gui, elapsed_seconds());
 	lv_timer_handler();
 
 	int ret = display_blanking_off(display);
@@ -217,7 +245,6 @@ int main(void)
 	}
 
 	wifi_module_init();
-	time_sync_active = true;
 	time_sync_blink = false;
 	boot_uptime_ms = k_uptime_get();
 	wifi_sync_icon_min_until_ms = boot_uptime_ms +
@@ -232,8 +259,16 @@ int main(void)
 	while (1) {
 		uint32_t boot_seconds =
 			(uint32_t)((k_uptime_get() - boot_uptime_ms) / MSEC_PER_SEC);
+		bool may_sleep = boot_seconds >= BTN_WAKE_GRACE_SECONDS;
 
-		if (sleep_requested || boot_seconds >= AUTO_SLEEP_SECONDS) {
+		/*
+		 * Discard any button press during the boot grace window: the wake
+		 * press (and any hold-to-boot) lands here and must not shut the
+		 * device back down. Shutdown needs a fresh press after the grace.
+		 */
+		if (!may_sleep) {
+			sleep_requested = false;
+		} else if (sleep_requested || boot_seconds >= AUTO_SLEEP_SECONDS) {
 			enter_sleep(display);
 		}
 
