@@ -1,21 +1,28 @@
 #ifndef WIFI_CREDS_H
 #define WIFI_CREDS_H
-
 #include <zephyr/net/wifi_mgmt.h>
+
 
 /**
  * @brief WiFi network credentials
  *
- * Struct definition lives here. The actual `known_networks[]` array and
- * `KNOWN_NETWORKS_COUNT` macro live in `secrets.h` (gitignored).
- * See `secrets.h.example` for the template.
+ * Add or modify networks here to connect to known WiFi networks
  */
+
 struct wifi_network {
-	const char *ssid;
-	const char *password;
-	enum wifi_security_type security;
+  const char *ssid;
+  const char *password;
+  const char *security; /* "open", "wpa2", "wpa3" */
 };
 
-#include "secrets.h"
+/* Known WiFi networks */
+static const struct wifi_network known_networks[] = {
+    {.ssid = "FRITZ!Box 7490 MR", .password = "37727439968591318573", .security = "wpa2"},
+    {.ssid = "Hein", .password = "paulhein1!", .security = "wpa2"},
+    /* Add more networks here as needed */
+};
+
+#define KNOWN_NETWORKS_COUNT                                                   \
+  (sizeof(known_networks) / sizeof(known_networks[0]))
 
 #endif /* WIFI_CREDS_H */

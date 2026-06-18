@@ -133,20 +133,32 @@ void wifi_module_init(void)
 	net_mgmt_add_event_callback(&ipv4_cb);
 }
 
+static enum wifi_security_type parse_security(const char *s)
+{
+	if (s == NULL || strcmp(s, "open") == 0) {
+		return WIFI_SECURITY_TYPE_NONE;
+	}
+	if (strcmp(s, "wpa3") == 0) {
+		return WIFI_SECURITY_TYPE_SAE;
+	}
+	return WIFI_SECURITY_TYPE_PSK; /* "wpa2" / default */
+}
+
 static int try_connect(struct net_if *iface, const struct wifi_network *net,
 		       uint32_t timeout_ms)
 {
+	enum wifi_security_type security = parse_security(net->security);
 	struct wifi_connect_req_params wifi_params = {
 		.ssid = net->ssid,
 		.ssid_length = strlen(net->ssid),
-		.security = net->security,
+		.security = security,
 		.channel = WIFI_CHANNEL_ANY,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
 		.mfp = WIFI_MFP_OPTIONAL,
 		.timeout = SYS_FOREVER_MS,
 	};
 
-	if (net->security != WIFI_SECURITY_TYPE_NONE && net->password != NULL) {
+	if (security != WIFI_SECURITY_TYPE_NONE && net->password != NULL) {
 		wifi_params.psk = net->password;
 		wifi_params.psk_length = strlen(net->password);
 	}
